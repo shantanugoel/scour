@@ -1,61 +1,67 @@
 # Architecture
 
-scour is one Rust binary. It runs as one local daemon (`scour serve`), and all the agents on the machine use it.
-The daemon gets results from search engines through a cascade: it uses an HTTP client with a browser TLS
-fingerprint first. It uses a real browser only for the engines that need one. It drives that browser over CDP, the
-Chrome DevTools Protocol, which a program uses to control a browser. The browser runs as a separate child process.
-All parts are planned.
+scour is one Rust binary. It runs as one local daemon (`scour serve`), and the agents on the machine use it.
+The daemon asks Bing with an HTTP client that has a browser TLS fingerprint. It listens only on `127.0.0.1:7268`.
+No flag, variable or file changes that address. A cascade, more engines, MCP, and a browser for Google are planned.
+The browser would run as a separate child process and use CDP, the Chrome DevTools Protocol.
 
 The main reason for this shape: blocks come mostly from the IP and from the fingerprint, not from the tool. Thus
-most queries use the cheap tier. A bare `axum` server measured 1.95 MB and 11.6 MiB of memory; the setup issue measures
-the real binary. Only a Google query pays for a browser.
+most queries use the cheap tier. The release binary is 11688776 bytes. The idle daemon uses 9.1 MiB of memory.
+Only a Google query pays for a browser.
 
 ## Context
 
 ```mermaid
 flowchart LR
-  agent[AI agent] -- MCP over HTTP --> d[scour serve]
+  agent[AI agent, planned] -- MCP over HTTP --> d[scour serve]
   cli[scour CLI] -- HTTP JSON --> d
-  d -- HTTPS, IPv4, optional proxy --> eng[Bing, DDG, Brave, Mojeek]
-  d -- CDP --> br[Browser: Obscura or Chrome] --> g[Google]
-  d -. challenge .-> sol[Person or solver plugin]
+  d -- HTTPS, IPv4 --> bing[Bing]
+  d -. planned .-> eng[DDG, Brave, Mojeek]
+  d -. CDP, planned .-> br[Browser: Obscura or Chrome] --> g[Google]
+  d -. challenge, planned .-> sol[Person or solver plugin]
 ```
 
 ## Parts
 
 | Part | What it does | Technology | Status |
 | --- | --- | --- | --- |
-| Daemon | Holds the parts below. Serves MCP and the JSON API on one port, on localhost by default. | `tokio`, `axum` | planned |
+| Daemon | Serves the JSON API on `127.0.0.1:7268` only. MCP is planned. | `tokio`, `axum` | built |
 | MCP endpoint | It has one tool, `search(query, engines?)`. It returns the results, the state of each engine, and the open challenges, each with a live link for a person. | `rmcp` (streamable HTTP) | planned |
-| JSON API and CLI | `GET /search` returns JSON. `scour search "q"` is a client of this API in the same binary. | `axum`, `wreq` | planned |
+| JSON API and CLI | `GET /search` returns JSON. `scour search "q"` is a client of this API in the same binary. | `axum`, `wreq` | built |
 | Cascade | Selects the engines for a query and skips each engine that rests or is at its limit. It sends each HTTP engine through the HTTP tier, and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. It merges the results and removes duplicate URLs. | Rust | planned |
-| Engines | One module for each engine. Each module makes the request URL and parses the page into results. The engines are Bing, DuckDuckGo, Brave and Mojeek by default. Google is browser-only and opt-in. | `scraper` | planned |
-| HTTP tier | Sends requests with the TLS profile of each engine, for example Firefox for Brave. Uses IPv4 only. Sends the requests through one optional proxy (HTTP or SOCKS5), for all engines or for one engine. | `wreq`, `wreq-util` | planned |
+| Engines | Bing makes the request URL and parses the page. Each later engine is one file with the same shape. DuckDuckGo, Brave, Mojeek and Google are planned. There is no `Engine` trait until a second engine exists. | `scraper` | built for Bing |
+| HTTP tier | Sends the Bing request with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts the browser on the first browser query, or it connects to a CDP URL that the user gives. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` or `headless_chrome`; the browser spike selects one | planned |
-| Engine state | Keeps the health of each engine (`ok`, `empty`, `blocked`, `parse_failed`), its rest timer, its rate limit with jitter, and its daily count. | Rust, in memory | planned |
+| Engine state | Bing reports `ok` (1 or more results), `empty` (HTTP 200 and 0 results) or `error` (the request failed). `blocked`, `parse_failed`, the rest timer, the rate limit and the daily count are planned. | Rust, in memory | built for one engine |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. It shows the CAPTCHA to a person through the live link, which the agent passes on, or sends it to a solver plugin. | Rust; CDP `devtoolsFrontendUrl` | planned |
-| Fixtures and canary | Saved pages of each engine test the parsers. `scour canary` sends one query to each engine and prints its health. | Rust tests | planned |
+| Fixtures and canary | Saved Bing pages test the parser. `scour canary` sends one query to each engine and prints its health. | Rust tests | built for Bing |
 | Packaging | Has two Docker images: `scour` has only the binary and the cheap engines. `scour:browser` adds the one browser that the browser spike selects, and Xvfb (a virtual display) if that browser needs one. On a Linux host without Docker, the user installs a browser and sets its path. | Docker, static musl binary | planned |
 
 ## Data
 
-- **Search result.** This is JSON: `query`, and `results[]` with `url`, `title`, `content`, `engine` and `position`;
-  `engines[]` with `name` and `state`; and `challenges[]`. The result field names are the same as in SearXNG, so
-  that the format is familiar. We do not promise SearXNG compatibility, and we copy no SearXNG code (AGPL).
-- **Challenge.** `{id, engine, kind, page_url, screenshot (PNG), live_url?, expires_at}`. `kind` is `recaptcha`,
-  `cloudflare` or `unknown`. A person solves the CAPTCHA in the live page. Then the agent calls `search` again. The
-  handoff spike can change this shape.
-- **Configuration.** One TOML file, `~/.config/scour/config.toml`, and command flags. It holds the engines that are
-  on, the browser command or CDP URL, the rates, the proxy, and the solver plugin command or URL.
-- **State.** The daemon keeps all state in memory. A restart forgets the rest timers and the daily counts. scour
-  keeps no queries and no results on disk. The browser profile is deleted when the browser stops.
-- **Between the parts.** The daemon talks to the browser with CDP over WebSocket. It talks to a solver plugin with
-  JSON on stdin and stdout, or with a JSON POST to an HTTP endpoint (planned for a later milestone).
+- **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
+  `content`, `engine` and `position`, and `engines[]` with `name` and `state`. `engines[].error` is present only
+  when the state is `error`. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
+  planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
+  compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
+  `format=json` still works.
+- **Challenge.** This shape is planned: `{id, engine, kind, page_url, screenshot (PNG), live_url?, expires_at}`.
+  `kind` is `recaptcha`, `cloudflare` or `unknown`. A person solves the CAPTCHA in the live page. Then the agent
+  calls `search` again. The handoff spike can change this shape.
+- **Configuration.** One TOML file is planned. This version uses fixed defaults: Bing only, and
+  `127.0.0.1:7268`. No flag changes the address. A later milestone can add a listen flag for Docker. That change
+  makes the localhost invariant weaker for that case, so the owner decides it then.
+- **State.** The daemon writes no query and no result to disk. It prints one start line and no query. Rest
+  timers and daily counts are planned, and they will live in memory. The browser profile is planned. The daemon
+  will delete it when the browser stops.
+- **Between the parts.** The CLI talks to the daemon with HTTP JSON. The daemon does not talk to a browser yet.
+  That path is CDP over WebSocket, and it is planned. A solver plugin is planned too. It would use JSON on stdin
+  and stdout, or a JSON POST.
 
 ## Choices
 
-- **Rust.** `wreq-util` has current Chrome, Firefox and Safari TLS profiles in pure Rust. The measured static binary
-  is 1.95 MB and uses 11.6 MiB of memory. Obscura is Rust too. We did not use Go, because its fingerprint client
+- **Rust.** `wreq-util` has current Chrome, Firefox and Safari TLS profiles in pure Rust. The release binary is
+  11688776 bytes and the idle daemon uses 9.1 MiB of memory. Obscura is Rust too. We did not use Go, because its fingerprint client
   (`tls-client`) replaces `net/http` and its HTTP/2 layer has no licence file; `chromedp` is better than the Rust
   CDP clients, but the browser is a separate process in any language. We did not use Zig, because it has no library
   that gives HTTP a browser TLS fingerprint, no CDP client and no HTML parser.
@@ -90,8 +96,9 @@ flowchart LR
 - **One proxy, no rotation.** A user on a server with a flagged datacenter IP can send requests through a home or
   residential proxy. We did not build a rotating pool, because it needs its own health checks and it is the start
   of a scraping service.
-- **Health from the parsed result count.** A page with HTTP 200 and 0 results is `empty` or `parse_failed`, not
-  `ok`. We did not use the HTTP status alone, because silent empty pages stopped most earlier projects.
+- **Health from the parsed result count.** A page with HTTP 200 and 0 results is `empty`, not `ok`. A failed
+  request is `error`. `parse_failed` is planned, so a page the parser cannot read is `empty` until then. We did
+  not use the HTTP status alone, because silent empty pages stopped most earlier projects.
 - **A browser only for browser-only engines.** A blocked HTTP engine rests. We did not send it to the browser,
   because the research showed that a browser on a blocked IP gets the same block.
 - **IPv4 only.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
