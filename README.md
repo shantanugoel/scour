@@ -61,3 +61,7 @@ The idle daemon memory, in kilobytes (`VmRSS`):
 ```
 
 Measured value: 9368 kB.
+
+## Licence
+
+scour is under the Apache License 2.0. The text is in `LICENSE`.
