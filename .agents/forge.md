@@ -13,7 +13,7 @@ The `forge` skill reads this file. Edit it as necessary. Run `forge init` again 
 | Run | The steps under "Run" in `README.md`. |
 | Evidence | `.evidence/` |
 | Roadmap | #5 |
-| Backlog | none |
+| Backlog | #9 |
 | Branch | `issue/<issue>-<short-name>` |
 | Docs | `README.md`: what scour is, and how to install, run and check it. `docs/`: design and architecture notes. |
 | Dependencies | Allowed. Give the reason in the pull request. |
