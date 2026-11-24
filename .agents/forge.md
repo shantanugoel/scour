@@ -9,8 +9,8 @@ The `forge` skill reads this file. Edit it as necessary. Run `forge init` again 
 | Process | full |
 | Tracker | github |
 | Repository | shantanugoel/scour |
-| Check | TBD. The first slice sets up the stack and a check script, then writes its command here. |
-| Run | TBD. The first slice writes the run steps in `README.md`. |
+| Check | `scripts/check` |
+| Run | The steps under "Run" in `README.md`. |
 | Evidence | `.evidence/` |
 | Roadmap | #5 |
 | Backlog | none |
