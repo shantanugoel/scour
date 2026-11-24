@@ -1,34 +1,25 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::api::{ADDR, EngineState, SearchResponse};
 
+/// Longer than the 10 s Bing timeout, so the daemon can answer first.
+const DAEMON_WAIT: Duration = Duration::from_secs(15);
+
 pub async fn search(query: &str) -> ExitCode {
-    let client = match crate::search::http_client() {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("scour: cannot start the client: {err}");
-            return ExitCode::from(1);
-        }
-    };
-    let mut url = url::Url::parse(&format!("http://{ADDR}/search")).expect("daemon url");
-    url.query_pairs_mut().append_pair("q", query);
-    let response = match client.get(url.as_str()).send().await {
+    let endpoint = format!("http://{ADDR}/search");
+    let response = match request_daemon(&endpoint, query).await {
         Ok(response) => response,
-        Err(err) => {
-            // The error text includes the daemon URL, and that URL includes the query.
-            if err.is_timeout() {
-                eprintln!("scour: no answer from {ADDR} in 10 s");
-            } else {
-                eprintln!("scour: no daemon on {ADDR}. Start it with: scour serve");
-            }
+        Err(line) => {
+            eprintln!("{line}");
             return ExitCode::from(1);
         }
     };
     let status = response.status().as_u16();
     let body = match response.text().await {
         Ok(body) => body,
-        Err(_) => {
-            eprintln!("scour: no answer from {ADDR} in 10 s");
+        Err(err) => {
+            eprintln!("{}", body_read_failure_message(&err));
             return ExitCode::from(1);
         }
     };
@@ -119,6 +110,43 @@ struct ApiError {
     error: String,
 }
 
+async fn request_daemon(endpoint: &str, query: &str) -> Result<wreq::Response, String> {
+    let client = crate::search::http_client()
+        .map_err(|err| format!("scour: cannot start the client: {err}"))?;
+    let mut url = url::Url::parse(endpoint).expect("daemon url");
+    url.query_pairs_mut().append_pair("q", query);
+    client
+        .get(url.as_str())
+        .timeout(DAEMON_WAIT)
+        .send()
+        .await
+        .map_err(|err| connect_failure_message(&err))
+}
+
+fn connect_failure_message(err: &wreq::Error) -> String {
+    // The error text includes the daemon URL, and that URL includes the query.
+    if err.is_timeout() {
+        timeout_message()
+    } else {
+        format!("scour: no daemon on {ADDR}. Start it with: scour serve")
+    }
+}
+
+fn body_read_failure_message(err: &wreq::Error) -> String {
+    if err.is_timeout() {
+        timeout_message()
+    } else {
+        "scour: the search failed".to_string()
+    }
+}
+
+fn timeout_message() -> String {
+    format!(
+        "scour: no answer from {ADDR} in {} s",
+        DAEMON_WAIT.as_secs()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +215,23 @@ mod tests {
         assert!(presented.success);
         assert!(presented.stderr.is_empty());
         assert_eq!(presented.stdout, "bing: empty (0 results)\n");
+    }
+
+    #[tokio::test]
+    async fn closed_loopback_port_tells_the_person_to_start_the_daemon() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        drop(listener);
+        assert_ne!(address.port(), ADDR.port());
+        let endpoint = format!("http://{address}/search");
+        let err = request_daemon(&endpoint, "x")
+            .await
+            .expect_err("closed port");
+        assert_eq!(
+            err,
+            "scour: no daemon on 127.0.0.1:7268. Start it with: scour serve"
+        );
     }
 }

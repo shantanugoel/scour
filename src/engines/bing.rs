@@ -53,21 +53,26 @@ pub fn parse(html: &str) -> Vec<Hit> {
 fn result_url(href: &str) -> Option<String> {
     let base = url::Url::parse("https://www.bing.com").ok()?;
     let parsed = base.join(href).ok()?;
-    let host = parsed.host_str().unwrap_or("");
-    if !is_bing_host(host) {
-        return Some(href.to_string());
+    if !parsed.host_str().is_some_and(is_bing_host) {
+        return accepted_result(&parsed);
     }
     let encoded = parsed.query_pairs().find(|(key, _)| key == "u")?.1;
     let encoded = encoded.strip_prefix("a1")?;
     let encoded = encoded.trim_end_matches('=');
     let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
     let text = String::from_utf8(bytes).ok()?;
-    let text = text.trim();
-    let destination = url::Url::parse(text).ok()?;
-    if is_bing_host(destination.host_str()?) {
+    let destination = url::Url::parse(text.trim()).ok()?;
+    accepted_result(&destination)
+}
+
+fn accepted_result(url: &url::Url) -> Option<String> {
+    if url.scheme() != "http" && url.scheme() != "https" {
         return None;
     }
-    Some(text.to_string())
+    if is_bing_host(url.host_str()?) {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 fn is_bing_host(host: &str) -> bool {
@@ -81,4 +86,35 @@ fn plain_text(text: &str) -> String {
 
 fn selector(source: &str) -> scraper::Selector {
     scraper::Selector::parse(source).expect("selector")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    fn page(href: &str) -> String {
+        format!(
+            "<ol id=\"b_results\"><li class=\"b_algo\"><h2><a href=\"{href}\">Title</a></h2><div class=\"b_caption\"><p>Snippet</p></div></li></ol>"
+        )
+    }
+
+    #[test]
+    fn non_http_links_are_not_results() {
+        let hrefs = [
+            "javascript:void(0)",
+            "mailto:a@b",
+            "file://localhost/tmp",
+            "https://www.bing.com/ck/a?u=a1ZmlsZTovL2xvY2FsaG9zdC90bXA",
+        ];
+        for href in hrefs {
+            assert!(parse(&page(href)).is_empty(), "{href}");
+        }
+    }
+
+    #[test]
+    fn protocol_relative_link_is_an_https_url() {
+        let hits = parse(&page("//example.com/a"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/a");
+    }
 }

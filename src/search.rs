@@ -25,19 +25,22 @@ pub async fn search(client: &wreq::Client, query: &str) -> SearchResponse {
     {
         Ok(response) => {
             let status = response.status().as_u16();
-            if status != 200 {
-                return error_response(query, format!("HTTP {status}"));
-            }
             match response.text().await {
                 Ok(body) => response_for_page(query, status, &body),
-                Err(err) => error_response(query, fetch_error(&err)),
+                Err(err) => {
+                    if status != 200 {
+                        response_for_page(query, status, "")
+                    } else {
+                        error_response(query, fetch_error(&err))
+                    }
+                }
             }
         }
         Err(err) => error_response(query, fetch_error(&err)),
     }
 }
 
-pub fn response_for_page(query: &str, status: u16, body: &str) -> SearchResponse {
+fn response_for_page(query: &str, status: u16, body: &str) -> SearchResponse {
     if status != 200 {
         return error_response(query, format!("HTTP {status}"));
     }

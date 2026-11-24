@@ -73,15 +73,3 @@ async fn get_search(
     let body = crate::search::search(&client, query).await;
     (StatusCode::OK, Json(body)).into_response()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daemon_listens_on_ipv4_localhost_only() {
-        assert_eq!(ADDR.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        assert!(ADDR.ip().is_loopback());
-        assert_eq!(ADDR.port(), 7268);
-    }
-}
