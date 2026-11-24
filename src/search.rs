@@ -248,6 +248,7 @@ mod tests {
 
     #[test]
     fn saved_page_with_no_results_reports_empty() {
+        // This page is made from the saved result page. Bing did not send it.
         let response = response_for_page("nothing", 200, EMPTY_PAGE);
         assert_eq!(response.results.len(), 0);
         assert_eq!(response.engines.len(), 1);
