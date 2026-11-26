@@ -1,10 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+
+use crate::search::Searcher;
 
 /// The daemon listens here. No flag, variable or file can change it.
 pub const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7268);
@@ -51,14 +54,14 @@ struct ErrorBody {
     error: &'static str,
 }
 
-pub fn router(client: wreq::Client) -> axum::Router {
+pub fn router(searcher: Arc<Searcher>) -> axum::Router {
     axum::Router::new()
         .route("/search", axum::routing::get(get_search))
-        .with_state(client)
+        .with_state(searcher)
 }
 
 async fn get_search(
-    State(client): State<wreq::Client>,
+    State(searcher): State<Arc<Searcher>>,
     Query(params): Query<SearchParams>,
 ) -> Response {
     let Some(query) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) else {
@@ -70,6 +73,6 @@ async fn get_search(
         )
             .into_response();
     };
-    let body = crate::search::search(&client, query).await;
+    let body = searcher.search(query).await;
     (StatusCode::OK, Json(body)).into_response()
 }

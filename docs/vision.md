@@ -80,8 +80,9 @@ solver plugin.
   and the rate limits.
 - We do not make Google a default engine, because Google needs JavaScript and a browser. Raw HTTP got 0 results in
   each test.
-- We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 4% to 11% of the Bing results
-  matched the query, Brave gave HTTP 429 and Mojeek gave HTTP 403. A person can turn them on.
+- We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 0 of 238 plain HTTP Bing
+  results matched the query, while headful Chrome matched 58% on 2 of 3 queries. Brave gave HTTP 429 and Mojeek gave
+  HTTP 403. A person can turn them on.
 - We do not link a browser into the `scour` binary, because the only browser that got Google results is Chrome,
   and its installed size is 437 MB. A browser crash must also not stop the daemon. The browser runs as a child
   process.
@@ -104,7 +105,7 @@ solver plugin.
 - **Privacy and data:** scour runs on the machine of the user. It keeps no queries and no results on disk. It keeps
   the engine state in memory, and only the configuration file on disk.
 - **Search budget:** DuckDuckGo is the only default engine, thus all agents on the machine share one budget.
-  Measured: DuckDuckGo answered 54 of 54 queries in 60 minutes, at 1 request in 30 to 90 seconds. Not measured: a
+  Measured: DuckDuckGo answered 60 of 60 queries in 60 minutes, at 1 request in 31 to 89 seconds. Not measured: a
   faster pace, a longer run, and the limit for one day. The research estimate is 50 to 100 queries each day from
   one IP. scour shows the daily count of each engine, and rests an engine at its limit.
 - **Licence:** Apache-2.0, the same as `wreq`. It includes a patent grant.

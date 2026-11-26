@@ -217,6 +217,46 @@ mod tests {
         assert_eq!(presented.stdout, "bing: empty (0 results)\n");
     }
 
+    #[test]
+    fn each_enabled_engine_gets_a_summary_line() {
+        let response = SearchResponse {
+            query: "x".to_string(),
+            results: vec![
+                ResultItem {
+                    url: "https://one.example/".to_string(),
+                    title: "One".to_string(),
+                    content: String::new(),
+                    engine: "duckduckgo".to_string(),
+                    position: 1,
+                },
+                ResultItem {
+                    url: "https://two.example/".to_string(),
+                    title: "Two".to_string(),
+                    content: String::new(),
+                    engine: "bing".to_string(),
+                    position: 2,
+                },
+            ],
+            engines: vec![
+                EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state: EngineState::Ok,
+                    error: None,
+                },
+                EngineStatus {
+                    name: "bing".to_string(),
+                    state: EngineState::Ok,
+                    error: None,
+                },
+            ],
+        };
+        let presented = present(&response);
+        assert!(presented.success);
+        assert!(presented.stdout.contains("duckduckgo: ok (1 results)\n"));
+        assert!(presented.stdout.contains("bing: ok (1 results)\n"));
+        assert!(presented.stderr.is_empty());
+    }
+
     #[tokio::test]
     async fn closed_loopback_port_tells_the_person_to_start_the_daemon() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

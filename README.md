@@ -1,6 +1,7 @@
 # scour
 
-scour is a local search tool. One daemon asks Bing. You and your agents use that daemon.
+scour is a local search tool. One daemon asks DuckDuckGo by default. You and your agents use that daemon.
+A person can turn on Bing in a configuration file.
 
 scour is for personal use, and nobody must run it as a public instance.
 
@@ -32,7 +33,27 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 ./target/release/scour search "rust async runtime"
 ```
 
-The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the result site. The last line names the engine `bing` and the state `ok`.
+The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the
+result site. The last line names the engine `duckduckgo` and the state `ok`.
+
+## Configure
+
+By default, scour asks DuckDuckGo only. To turn on Bing, write this file:
+
+```toml
+# $XDG_CONFIG_HOME/scour/config.toml, or $HOME/.config/scour/config.toml
+engines = ["duckduckgo", "bing"]
+```
+
+Or start the daemon with a file:
+
+```sh
+./target/release/scour serve --config /path/to/config.toml
+```
+
+The `engines` list accepts `duckduckgo` and `bing`. The daemon stops with exit code 1 for an unknown key, an unknown
+or duplicate engine name, an empty list, or a missing `--config` file. A TOML error prints the parser message and
+the line number, not the line text, so a secret in the file does not appear in the terminal.
 
 ## Check
 
@@ -42,7 +63,8 @@ Run:
 scripts/check
 ```
 
-The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests make no request to Bing.
+The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests make no request
+to an engine.
 
 ## Size and memory
 
@@ -52,7 +74,7 @@ The release binary size, in bytes:
 stat -c %s target/release/scour
 ```
 
-Measured value: 11688776 bytes.
+Measured value: 11957968 bytes.
 
 The idle daemon memory, in kilobytes (`VmRSS`):
 
@@ -60,7 +82,7 @@ The idle daemon memory, in kilobytes (`VmRSS`):
 ./target/release/scour serve >/dev/null & pid=$!; sleep 1; awk '/^VmRSS:/ { print $2 }' /proc/$pid/status; kill $pid
 ```
 
-Measured value: 9368 kB.
+Measured value: 9396 kB.
 
 ## Licence
 
