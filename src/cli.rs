@@ -75,10 +75,7 @@ fn present(response: &SearchResponse) -> Presented {
             result.position, result.title, result.url, result.content
         ));
     }
-    let success = response
-        .engines
-        .iter()
-        .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty));
+    let success = response.has_answer();
     if !stdout.is_empty() && success {
         stdout.push('\n');
     }
@@ -94,6 +91,12 @@ fn present(response: &SearchResponse) -> Presented {
             }
             EngineState::Empty => {
                 stdout.push_str(&format!("{}: empty ({count} results)\n", engine.name));
+            }
+            EngineState::Blocked => {
+                stderr.push_str(&format!("scour: {}: blocked\n", engine.name));
+            }
+            EngineState::ParseFailed => {
+                stderr.push_str(&format!("scour: {}: parse_failed\n", engine.name));
             }
             EngineState::Error => {
                 let message = engine.error.as_deref().unwrap_or("error");

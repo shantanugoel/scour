@@ -19,6 +19,14 @@ struct Answer {
 }
 
 impl Answer {
+    fn without_hits(state: EngineState) -> Self {
+        Self {
+            hits: None,
+            state,
+            error: None,
+        }
+    }
+
     fn error(message: String) -> Self {
         Self {
             hits: None,
@@ -79,15 +87,13 @@ impl Searcher {
         {
             Ok(response) => {
                 let status = response.status().as_u16();
+                if matches!(status, 403 | 429) {
+                    return Answer::without_hits(EngineState::Blocked);
+                }
                 match response.text().await {
                     Ok(body) => answer_for_page(engine, status, &body),
-                    Err(err) => {
-                        if status != 200 {
-                            answer_for_page(engine, status, "")
-                        } else {
-                            Answer::error(fetch_error(&err, &host))
-                        }
-                    }
+                    Err(_) if status != 200 => Answer::error(format!("HTTP {status}")),
+                    Err(err) => Answer::error(fetch_error(&err, &host)),
                 }
             }
             Err(err) => Answer::error(fetch_error(&err, &host)),
@@ -96,20 +102,16 @@ impl Searcher {
 }
 
 fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
-    if status != 200 {
-        return Answer::error(format!("HTTP {status}"));
-    }
     match (engine.read)(status, body) {
+        Page::Blocked => Answer::without_hits(EngineState::Blocked),
+        _ if status != 200 => Answer::error(format!("HTTP {status}")),
         Page::Results(hits) => Answer {
             hits: Some(hits),
             state: EngineState::Ok,
             error: None,
         },
-        Page::Empty => Answer {
-            hits: None,
-            state: EngineState::Empty,
-            error: None,
-        },
+        Page::Empty => Answer::without_hits(EngineState::Empty),
+        Page::ParseFailed => Answer::without_hits(EngineState::ParseFailed),
     }
 }
 

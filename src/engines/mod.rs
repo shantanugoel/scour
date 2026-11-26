@@ -22,6 +22,8 @@ pub struct Engine {
 pub enum Page {
     Results(Vec<Hit>),
     Empty,
+    Blocked,
+    ParseFailed,
 }
 
 /// Every known engine. The default config enables only DuckDuckGo.

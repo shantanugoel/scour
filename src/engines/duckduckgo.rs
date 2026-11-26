@@ -19,17 +19,33 @@ fn request_url(base: &url::Url, query: &str) -> url::Url {
 }
 
 fn read(_status: u16, body: &str) -> Page {
-    let hits = parse(body);
-    if hits.is_empty() {
+    let document = scraper::Html::parse_document(body);
+    let challenge =
+        selector("form#challenge-form, form[action*='anomaly.js'], script[src*='anomaly.js']");
+    if document.select(&challenge).next().is_some() {
+        return Page::Blocked;
+    }
+
+    let hits = parse(&document);
+    if !hits.is_empty() {
+        return Page::Results(hits);
+    }
+
+    let containers = selector("#links, .results");
+    if document.select(&selector(".no-results")).next().is_some()
+        || document
+            .select(&containers)
+            .flat_map(|container| container.text())
+            .any(|text| text.split_whitespace().eq(["No", "results."]))
+    {
         Page::Empty
     } else {
-        Page::Results(hits)
+        Page::ParseFailed
     }
 }
 
 /// Organic results in page order. Ad rows and links that stay on duckduckgo.com are omitted.
-fn parse(html: &str) -> Vec<Hit> {
-    let document = scraper::Html::parse_document(html);
+fn parse(document: &scraper::Html) -> Vec<Hit> {
     let item_selector = selector("div.result:not(.result--ad)");
     let title_selector = selector("a.result__a");
     let snippet_selector = selector(".result__snippet");
@@ -160,6 +176,15 @@ mod tests {
     #[test]
     fn saved_page_without_results_is_empty() {
         assert_eq!((ENGINE.read)(200, EMPTY_PAGE), Page::Empty);
+    }
+
+    #[test]
+    fn no_results_text_without_the_class_is_empty() {
+        let without_class = EMPTY_PAGE.replace(r#" class="no-results""#, "");
+        for marker in ["No  results.", "No results."] {
+            let page = without_class.replace("No  results.", marker);
+            assert_eq!((ENGINE.read)(200, &page), Page::Empty, "{marker}");
+        }
     }
 
     #[test]

@@ -20,6 +20,14 @@ pub struct SearchResponse {
     pub engines: Vec<EngineStatus>,
 }
 
+impl SearchResponse {
+    pub(crate) fn has_answer(&self) -> bool {
+        self.engines
+            .iter()
+            .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultItem {
     pub url: String,
@@ -34,6 +42,8 @@ pub struct ResultItem {
 pub enum EngineState {
     Ok,
     Empty,
+    Blocked,
+    ParseFailed,
     Error,
 }
 
