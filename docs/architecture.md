@@ -3,19 +3,19 @@
 scour is one Rust binary. It runs as one local daemon (`scour serve`), and the agents on the machine use it.
 Today the daemon asks DuckDuckGo by default and Bing only if a person turns it on. It uses an HTTP client that has
 a browser TLS fingerprint. It listens only on `127.0.0.1:7268`. No flag, variable or file changes that address.
-A cascade, MCP, and a browser for Google are planned too. The browser is headful Chrome on Xvfb (a virtual
-display). It runs as a child process, and the daemon drives it through CDP (the Chrome DevTools Protocol) with
-`chromiumoxide`.
+An agent searches through MCP over streamable HTTP at `/mcp`. A cascade and a browser for Google are planned too.
+The browser is headful Chrome on Xvfb (a virtual display). It runs as a child process, and the daemon drives it
+through CDP (the Chrome DevTools Protocol) with `chromiumoxide`.
 
 The main reason for this shape: blocks come mostly from the IP and from the fingerprint, not from the tool. Thus
-most queries use the cheap tier. The release binary is 11957968 bytes. The idle daemon uses 9.2 MiB of memory.
+most queries use the cheap tier. The release binary is 17361576 bytes. The idle daemon uses 10.3 MiB of memory.
 Only a Google query pays for a browser.
 
 ## Context
 
 ```mermaid
 flowchart LR
-  agent[AI agent, planned] -- MCP over HTTP --> d[scour serve]
+  agent[AI agent] -- MCP over HTTP --> d[scour serve]
   cli[scour CLI] -- HTTP JSON --> d
   d -- HTTPS, IPv4, default --> ddg[DuckDuckGo]
   d -- HTTPS, IPv4, opt-in --> bing[Bing]
@@ -28,8 +28,8 @@ flowchart LR
 
 | Part | What it does | Technology | Status |
 | --- | --- | --- | --- |
-| Daemon | Serves the JSON API on `127.0.0.1:7268` only. MCP is planned. | `tokio`, `axum` | built |
-| MCP endpoint | It has one tool, `search(query, engines?)`. It returns the results, the state of each engine, and the open challenges, each with a live link for a person. | `rmcp` (streamable HTTP) | planned |
+| Daemon | Serves the JSON API and MCP on `127.0.0.1:7268` only. One layer rejects every request with a foreign `Host` or `Origin`. | `tokio`, `axum` | built |
+| MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The tool description warns that titles and snippets are untrusted web text. A per-query `engines` argument and the open challenges are planned. | `rmcp` (streamable HTTP, stateless JSON) | built |
 | JSON API and CLI | `GET /search` returns JSON. `scour search "q"` is a client of this API in the same binary. | `axum`, `wreq` | built |
 | Cascade | Selects the engines for a query and skips each engine that rests or is at its limit. It sends each HTTP engine through the HTTP tier, and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. It merges the results and removes duplicate URLs. | Rust | planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
@@ -48,6 +48,20 @@ flowchart LR
   planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
   compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
   `format=json` still works.
+- **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
+  `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
+  answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
+  `{query: string}`. For a search answer, `tools/call` returns the `GET /search` JSON in `structuredContent` and
+  the `scour search` text in `content[0].text`. A blank query sets `isError: true` and returns only the error
+  message in `content[0].text`. A search answer sets `isError: true` when no engine is `ok` or `empty`.
+  A blank query sends no engine request. The server reports `serverInfo` as `scour`.
+- **Local-only guard.** One `Router::layer` wraps every route, including `/mcp`, `/search` and an unknown path. A
+  request requires one `Host` header with `127.0.0.1[:port]` or `localhost[:port]`. An optional `Origin` header
+  must appear at most once and use `http://127.0.0.1[:port]` or `http://localhost[:port]`. Each optional port
+  must contain only digits and have a value from 0 to 65535. Any other request gets HTTP 403 with
+  `{"error":"the Host or Origin is not local"}`. The guard stops a web page from reaching the daemon through a
+  name that points at `127.0.0.1` (DNS rebinding). `rmcp` also checks the `Host` by default; our layer runs first
+  and answers in the same way on every route.
 - **Challenge.** This shape is planned: `{id, engine, kind, page_url, live_url, expires_at}`. A screenshot is not in the shape, because only a solver plugin would use it.
   `kind` is `recaptcha`, `cloudflare` or `unknown`.
   - `live_url` is the local Chrome inspector of the challenge tab:
@@ -69,8 +83,9 @@ flowchart LR
   `--config` file. A TOML error shows the parser message and the line number, never the source line, so a secret in
   the file cannot leak. The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
   for Docker. That change makes the localhost invariant weaker for that case, so the owner decides it then.
-- **State.** The daemon writes no query and no result to disk. It prints one start line and no query. Rest
-  timers and daily counts are planned, and they will live in memory. The browser profile is planned. The daemon
+- **State.** The daemon writes no query and no result to disk. It prints one start line and no query. It installs
+  no `tracing` subscriber, so a library log call cannot print a query. Rest timers and daily counts are planned,
+  and they will live in memory. The browser profile is planned. The daemon
   will delete it when the browser stops. The `GOOGLE_ABUSE_EXEMPTION` cookie lives only in that profile, so a
   browser stop ends the solved session.
 - **Between the parts.** The CLI talks to the daemon with HTTP JSON. The daemon does not talk to a browser yet.
@@ -80,7 +95,7 @@ flowchart LR
 ## Choices
 
 - **Rust.** `wreq-util` has current Chrome, Firefox and Safari TLS profiles in pure Rust. The release binary is
-  11957968 bytes and the idle daemon uses 9.2 MiB of memory. A static musl build with `wreq` works: the engine
+  17361576 bytes and the idle daemon uses 10.3 MiB of memory. A static musl build with `wreq` works: the engine
   spike binary was 8.2 MB, with a peak of 28.8 MiB. We did not use Go, because its fingerprint client
   (`tls-client`) replaces `net/http` and its HTTP/2 layer has no licence file; `chromedp` is better than the Rust
   CDP clients, but the browser is a separate process in any language. We did not use Zig, because it has no library
@@ -147,6 +162,11 @@ flowchart LR
   one if restarts reset the daily limits too often.
 - **The CLI uses the JSON API, not an MCP client.** `curl` and SearXNG clients can use the same endpoint. The CLI
   needs no MCP session. We did not use an MCP client in the CLI, because it adds a session for one call.
+- **A stateless MCP server with no session ID.** The daemon holds no per-client MCP state, and every request is one
+  JSON body with one answer. The CLI, a plain JSON-RPC script, and an agent use the same daemon, and a restart
+  loses nothing that a client must renew. We did not use `legacy_session_mode`, because a session ID adds a
+  handshake and a session table for a tool that holds no conversation state. If a client needs sessions, turn that
+  mode on and record why.
 - **Two Docker images.** Users who do not need Google do not download a browser. We did not use one image, because
   Chrome makes it several hundred MB larger: the installed Chromium is 437 MB. `scour:browser` has one browser,
   not two.

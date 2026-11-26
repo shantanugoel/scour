@@ -51,6 +51,12 @@ pub async fn search(query: &str) -> ExitCode {
     }
 }
 
+/// The whole answer as one text, for a caller that has no separate error stream, such as MCP.
+pub fn render(response: &SearchResponse) -> String {
+    let presented = present(response);
+    format!("{}{}", presented.stdout, presented.stderr)
+}
+
 struct Presented {
     stdout: String,
     stderr: String,
