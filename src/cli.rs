@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::api::{ADDR, EngineState, SearchResponse};
 
-/// Longer than the 10 s Bing timeout, so the daemon can answer first.
-const DAEMON_WAIT: Duration = Duration::from_secs(15);
+/// Two engines can each take the 10 s search timeout, so wait longer than 20 s.
+const DAEMON_WAIT: Duration = Duration::from_secs(25);
 
 pub async fn search(query: &str) -> ExitCode {
     let endpoint = format!("http://{ADDR}/search");
@@ -215,6 +215,46 @@ mod tests {
         assert!(presented.success);
         assert!(presented.stderr.is_empty());
         assert_eq!(presented.stdout, "bing: empty (0 results)\n");
+    }
+
+    #[test]
+    fn each_enabled_engine_gets_a_summary_line() {
+        let response = SearchResponse {
+            query: "x".to_string(),
+            results: vec![
+                ResultItem {
+                    url: "https://one.example/".to_string(),
+                    title: "One".to_string(),
+                    content: String::new(),
+                    engine: "duckduckgo".to_string(),
+                    position: 1,
+                },
+                ResultItem {
+                    url: "https://two.example/".to_string(),
+                    title: "Two".to_string(),
+                    content: String::new(),
+                    engine: "bing".to_string(),
+                    position: 2,
+                },
+            ],
+            engines: vec![
+                EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state: EngineState::Ok,
+                    error: None,
+                },
+                EngineStatus {
+                    name: "bing".to_string(),
+                    state: EngineState::Ok,
+                    error: None,
+                },
+            ],
+        };
+        let presented = present(&response);
+        assert!(presented.success);
+        assert!(presented.stdout.contains("duckduckgo: ok (1 results)\n"));
+        assert!(presented.stdout.contains("bing: ok (1 results)\n"));
+        assert!(presented.stderr.is_empty());
     }
 
     #[tokio::test]

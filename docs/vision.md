@@ -80,8 +80,9 @@ solver plugin.
   and the rate limits.
 - We do not make Google a default engine, because Google needs JavaScript and a browser. Raw HTTP got 0 results in
   each test.
-- We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 4% to 11% of the Bing results
-  matched the query, Brave gave HTTP 429 and Mojeek gave HTTP 403. A person can turn them on.
+- We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 0 of 238 plain HTTP Bing
+  results matched the query, while headful Chrome matched 58% on 2 of 3 queries. Brave gave HTTP 429 and Mojeek gave
+  HTTP 403. A person can turn them on.
 - We do not link a browser into the `scour` binary, because the only browser that got Google results is Chrome,
   and its installed size is 437 MB. A browser crash must also not stop the daemon. The browser runs as a child
   process.
@@ -104,7 +105,7 @@ solver plugin.
 - **Privacy and data:** scour runs on the machine of the user. It keeps no queries and no results on disk. It keeps
   the engine state in memory, and only the configuration file on disk.
 - **Search budget:** DuckDuckGo is the only default engine, thus all agents on the machine share one budget.
-  Measured: DuckDuckGo answered 54 of 54 queries in 60 minutes, at 1 request in 30 to 90 seconds. Not measured: a
+  Measured: DuckDuckGo answered 60 of 60 queries in 60 minutes, at 1 request in 31 to 89 seconds. Not measured: a
   faster pace, a longer run, and the limit for one day. The research estimate is 50 to 100 queries each day from
   one IP. scour shows the daily count of each engine, and rests an engine at its limit.
 - **Licence:** Apache-2.0, the same as `wreq`. It includes a patent grant.
@@ -126,7 +127,6 @@ solver plugin.
 
 | Question | How we answer it (a spike, the owner, a milestone) | What waits on it |
 | --- | --- | --- |
-| Which cheap engine other than DuckDuckGo gives results that match the query to a paced `wreq` client: Startpage, Qwant, Yahoo, Ecosia, or Bing with a corrected request? Why do Bing results not match the query? | A spike ([#14](https://github.com/shantanugoel/scour/issues/14)), the first slice of milestone 1 | The default engine list of milestone 1, and the last step of its demo |
 | How fast, and for how long, can scour ask DuckDuckGo before a block? Measured only: 1 request in 30 to 90 seconds for 60 minutes. | Milestone 1: the plan sets a careful default pace, and the daily count shows the limit in use | The default pace and the daily limit of DuckDuckGo |
 | How does a person reach the live link when Chrome runs in Docker, with the CDP port on the loopback of the container? Which address does the daemon listen on in the container? Each answer can make the localhost invariant weaker. | The owner, in the plan of milestone 2 | The `scour:browser` image, and the handoff in Docker |
 | Does the local inspector of Chrome work with a narrow `--remote-allow-origins` value? Each spike run used `*`. | Milestone 2 | The start flags of Chrome |

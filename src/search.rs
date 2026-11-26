@@ -2,100 +2,134 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::api::{EngineState, EngineStatus, ResultItem, SearchResponse};
-use crate::engines::bing;
+use crate::config::Config;
+use crate::engines::{Engine, Hit, Page};
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct Searcher {
+    client: wreq::Client,
+    engines: Vec<&'static Engine>,
+}
+
+struct Answer {
+    hits: Option<Vec<Hit>>,
+    state: EngineState,
+    error: Option<String>,
+}
+
+impl Answer {
+    fn error(message: String) -> Self {
+        Self {
+            hits: None,
+            state: EngineState::Error,
+            error: Some(message),
+        }
+    }
+}
+
+impl Searcher {
+    pub fn new(config: &Config) -> wreq::Result<Self> {
+        Ok(Self {
+            client: http_client()?,
+            engines: config.engines.clone(),
+        })
+    }
+
+    pub async fn search(&self, query: &str) -> SearchResponse {
+        let mut results = Vec::new();
+        let mut engines = Vec::with_capacity(self.engines.len());
+        for engine in &self.engines {
+            let answer = self.fetch(engine, query).await;
+            if let Some(hits) = answer.hits {
+                for hit in hits {
+                    let position = (results.len() + 1) as u32;
+                    results.push(ResultItem {
+                        url: hit.url,
+                        title: hit.title,
+                        content: hit.content,
+                        engine: engine.name.to_string(),
+                        position,
+                    });
+                }
+            }
+            engines.push(EngineStatus {
+                name: engine.name.to_string(),
+                state: answer.state,
+                error: answer.error,
+            });
+        }
+        SearchResponse {
+            query: query.to_string(),
+            results,
+            engines,
+        }
+    }
+
+    async fn fetch(&self, engine: &Engine, query: &str) -> Answer {
+        let base = url::Url::parse(engine.base_url).expect("engine base url");
+        let host = base.host_str().unwrap_or(engine.base_url).to_string();
+        let url = (engine.request_url)(&base, query);
+        match self
+            .client
+            .get(url.as_str())
+            .emulation(engine.profile)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                match response.text().await {
+                    Ok(body) => answer_for_page(engine, status, &body),
+                    Err(err) => {
+                        if status != 200 {
+                            answer_for_page(engine, status, "")
+                        } else {
+                            Answer::error(fetch_error(&err, &host))
+                        }
+                    }
+                }
+            }
+            Err(err) => Answer::error(fetch_error(&err, &host)),
+        }
+    }
+}
+
+fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
+    if status != 200 {
+        return Answer::error(format!("HTTP {status}"));
+    }
+    match (engine.read)(status, body) {
+        Page::Results(hits) => Answer {
+            hits: Some(hits),
+            state: EngineState::Ok,
+            error: None,
+        },
+        Page::Empty => Answer {
+            hits: None,
+            state: EngineState::Empty,
+            error: None,
+        },
+    }
+}
 
 pub fn http_client() -> wreq::Result<wreq::Client> {
-    // wreq follows no redirects, and it reads the system proxy.
-    // This issue has no proxy. A Bing answer can be a redirect.
+    // wreq follows no redirects by default, and it reads the system proxy.
+    // scour has no proxy setting yet, and a Bing answer can be a redirect.
     wreq::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(TIMEOUT)
         .redirect(wreq::redirect::Policy::limited(10))
         .no_proxy()
         .dns_resolver(Ipv4Only)
         .build()
 }
 
-pub async fn search(client: &wreq::Client, query: &str) -> SearchResponse {
-    let url = bing::request_url(query);
-    match client
-        .get(url.as_str())
-        .emulation(bing::PROFILE)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            match response.text().await {
-                Ok(body) => response_for_page(query, status, &body),
-                Err(err) => {
-                    if status != 200 {
-                        response_for_page(query, status, "")
-                    } else {
-                        error_response(query, fetch_error(&err))
-                    }
-                }
-            }
-        }
-        Err(err) => error_response(query, fetch_error(&err)),
-    }
-}
-
-fn response_for_page(query: &str, status: u16, body: &str) -> SearchResponse {
-    if status != 200 {
-        return error_response(query, format!("HTTP {status}"));
-    }
-    let hits = bing::parse(body);
-    if hits.is_empty() {
-        return SearchResponse {
-            query: query.to_string(),
-            results: Vec::new(),
-            engines: vec![EngineStatus {
-                name: bing::NAME.to_string(),
-                state: EngineState::Empty,
-                error: None,
-            }],
-        };
-    }
-    let results = hits
-        .into_iter()
-        .enumerate()
-        .map(|(index, hit)| ResultItem {
-            url: hit.url,
-            title: hit.title,
-            content: hit.content,
-            engine: bing::NAME.to_string(),
-            position: (index + 1) as u32,
-        })
-        .collect();
-    SearchResponse {
-        query: query.to_string(),
-        results,
-        engines: vec![EngineStatus {
-            name: bing::NAME.to_string(),
-            state: EngineState::Ok,
-            error: None,
-        }],
-    }
-}
-
-fn error_response(query: &str, message: String) -> SearchResponse {
-    SearchResponse {
-        query: query.to_string(),
-        results: Vec::new(),
-        engines: vec![EngineStatus {
-            name: bing::NAME.to_string(),
-            state: EngineState::Error,
-            error: Some(message),
-        }],
-    }
-}
-
-fn fetch_error(err: &wreq::Error) -> String {
+fn fetch_error(err: &wreq::Error, host: &str) -> String {
     // The wreq error text includes the request URL, and the URL includes the query.
     if err.is_timeout() {
-        "no answer from www.bing.com in 10 s".to_string()
+        format!("no answer from {host} in {} s", TIMEOUT.as_secs())
     } else {
-        "cannot connect to www.bing.com".to_string()
+        format!("cannot connect to {host}")
     }
 }
 
@@ -131,9 +165,7 @@ fn box_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const RESULTS_PAGE: &str = include_str!("../fixtures/bing/results.html");
-    const EMPTY_PAGE: &str = include_str!("../fixtures/bing/empty.html");
+    use crate::engines::bing;
 
     /// DNS that fails before any connection, so the test makes no request.
     struct FailResolve;
@@ -149,57 +181,170 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ads_and_undecoded_bing_links_are_not_results() {
-        let html = r#"
-            <ol id="b_results">
-                <li class="b_ad">
-                    <h2><a href="https://ads.example/buy">Buy now</a></h2>
-                    <div class="b_caption"><p>An advertisement</p></div>
-                </li>
-                <li class="b_algo b_ad">
-                    <h2><a href="https://shop.example/sale">Sale</a></h2>
-                    <div class="b_caption"><p>Also an advertisement</p></div>
-                </li>
-                <li class="b_algo">
-                    <h2><a href="https://www.bing.com/ck/a?u=not-base64">Hidden</a></h2>
-                    <div class="b_caption"><p>This link does not decode</p></div>
-                </li>
-                <li class="b_algo">
-                    <h2><a href="https://www.bing.com/maps">Maps</a></h2>
-                    <div class="b_caption"><p>A bing.com page</p></div>
-                </li>
-                <li class="b_algo">
-                    <h2><a href="https://tokio.rs/">Tokio</a></h2>
-                    <div class="b_caption"><p>An asynchronous runtime</p></div>
-                </li>
-                <li class="b_rs"><a href="https://related.example/">related search</a></li>
-            </ol>
-        "#;
-        let response = response_for_page("rust", 200, html);
-        assert_eq!(response.engines[0].state, EngineState::Ok);
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].title, "Tokio");
-        assert_eq!(response.results[0].url, "https://tokio.rs/");
-        assert_eq!(response.results[0].content, "An asynchronous runtime");
-        assert_eq!(response.results[0].engine, "bing");
-        assert_eq!(response.results[0].position, 1);
-        assert!(!response.results[0].url.contains("bing.com"));
+    fn test_client() -> wreq::Client {
+        wreq::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .redirect(wreq::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap()
     }
 
-    #[test]
-    fn http_error_is_not_an_empty_answer() {
-        let response = response_for_page("x", 503, "<html></html>");
-        assert!(response.results.is_empty());
-        assert_eq!(response.engines[0].name, "bing");
-        assert_eq!(response.engines[0].state, EngineState::Error);
-        assert_eq!(response.engines[0].error.as_deref(), Some("HTTP 503"));
-        assert_ne!(response.engines[0].state, EngineState::Ok);
-        assert_ne!(response.engines[0].state, EngineState::Empty);
+    async fn serve(app: axum::Router) -> &'static str {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Box::leak(format!("http://{address}").into_boxed_str())
+    }
+
+    fn leaked(engine: Engine) -> &'static Engine {
+        Box::leak(Box::new(engine))
+    }
+
+    fn first_url(base: &url::Url, query: &str) -> url::Url {
+        let mut url = base.join("/first").unwrap();
+        url.query_pairs_mut().append_pair("q", query);
+        url
+    }
+
+    fn second_url(base: &url::Url, query: &str) -> url::Url {
+        let mut url = base.join("/second").unwrap();
+        url.query_pairs_mut().append_pair("q", query);
+        url
+    }
+
+    fn fail_url(base: &url::Url, query: &str) -> url::Url {
+        let mut url = base.join("/fail").unwrap();
+        url.query_pairs_mut().append_pair("q", query);
+        url
+    }
+
+    fn empty_url(base: &url::Url, query: &str) -> url::Url {
+        let mut url = base.join("/empty").unwrap();
+        url.query_pairs_mut().append_pair("q", query);
+        url
+    }
+
+    fn read_body(_status: u16, body: &str) -> Page {
+        Page::Results(vec![Hit {
+            url: format!("https://{}.example/", body.trim()),
+            title: body.trim().to_string(),
+            content: String::new(),
+        }])
+    }
+
+    fn read_empty(_status: u16, _body: &str) -> Page {
+        Page::Empty
     }
 
     #[tokio::test]
-    async fn search_that_cannot_reach_bing_reports_error() {
+    async fn both_enabled_engines_report_a_state_in_config_order() {
+        let app = axum::Router::new()
+            .route("/first", axum::routing::get(|| async { "first" }))
+            .route("/second", axum::routing::get(|| async { "second" }));
+        let base = serve(app).await;
+        let engines = vec![
+            leaked(Engine {
+                name: "first",
+                base_url: base,
+                profile: wreq_util::Profile::Chrome149,
+                request_url: first_url,
+                read: read_body,
+            }),
+            leaked(Engine {
+                name: "second",
+                base_url: base,
+                profile: wreq_util::Profile::Chrome149,
+                request_url: second_url,
+                read: read_body,
+            }),
+        ];
+        let searcher = Searcher {
+            client: test_client(),
+            engines,
+        };
+        let response = searcher.search("rust async runtime").await;
+        assert_eq!(response.query, "rust async runtime");
+        assert_eq!(response.engines.len(), 2);
+        assert_eq!(response.engines[0].name, "first");
+        assert_eq!(response.engines[0].state, EngineState::Ok);
+        assert_eq!(response.engines[1].name, "second");
+        assert_eq!(response.engines[1].state, EngineState::Ok);
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].position, 1);
+        assert_eq!(response.results[0].engine, "first");
+        assert_eq!(response.results[0].title, "first");
+        assert_eq!(response.results[1].position, 2);
+        assert_eq!(response.results[1].engine, "second");
+        assert_eq!(response.results[1].title, "second");
+    }
+
+    #[tokio::test]
+    async fn one_failed_engine_does_not_stop_the_other() {
+        let app = axum::Router::new()
+            .route(
+                "/fail",
+                axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route("/second", axum::routing::get(|| async { "second" }));
+        let base = serve(app).await;
+        let engines = vec![
+            leaked(Engine {
+                name: "failing",
+                base_url: base,
+                profile: wreq_util::Profile::Chrome149,
+                request_url: fail_url,
+                read: read_body,
+            }),
+            leaked(Engine {
+                name: "working",
+                base_url: base,
+                profile: wreq_util::Profile::Chrome149,
+                request_url: second_url,
+                read: read_body,
+            }),
+        ];
+        let searcher = Searcher {
+            client: test_client(),
+            engines,
+        };
+        let response = searcher.search("x").await;
+        assert_eq!(response.engines[0].state, EngineState::Error);
+        assert_eq!(response.engines[0].error.as_deref(), Some("HTTP 503"));
+        assert_ne!(response.engines[0].state, EngineState::Empty);
+        assert_eq!(response.engines[1].state, EngineState::Ok);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].engine, "working");
+        assert_eq!(response.results[0].position, 1);
+    }
+
+    #[tokio::test]
+    async fn page_without_results_reports_empty() {
+        let app = axum::Router::new().route("/empty", axum::routing::get(|| async { "" }));
+        let base = serve(app).await;
+        let engines = vec![leaked(Engine {
+            name: "empty",
+            base_url: base,
+            profile: wreq_util::Profile::Chrome149,
+            request_url: empty_url,
+            read: read_empty,
+        })];
+        let searcher = Searcher {
+            client: test_client(),
+            engines,
+        };
+        let response = searcher.search("x").await;
+        assert!(response.results.is_empty());
+        assert_eq!(response.engines[0].state, EngineState::Empty);
+        assert!(response.engines[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_that_cannot_reach_an_engine_reports_error() {
         // A resolver error stays on this machine. Port 443 is already in use here,
         // and `resolve` would send the HTTPS request to that local port.
         let client = wreq::Client::builder()
@@ -209,7 +354,11 @@ mod tests {
             .dns_resolver(FailResolve)
             .build()
             .unwrap();
-        let response = search(&client, "x").await;
+        let searcher = Searcher {
+            client,
+            engines: vec![&bing::ENGINE],
+        };
+        let response = searcher.search("secret query").await;
         assert!(response.results.is_empty());
         assert_eq!(response.engines.len(), 1);
         assert_eq!(response.engines[0].name, "bing");
@@ -218,43 +367,12 @@ mod tests {
             response.engines[0].error.as_deref(),
             Some("cannot connect to www.bing.com")
         );
-    }
-
-    #[test]
-    fn saved_result_page_reports_the_organic_results_as_ok() {
-        let response = response_for_page("rust async runtime", 200, RESULTS_PAGE);
-        assert_eq!(response.query, "rust async runtime");
-        assert_eq!(response.engines.len(), 1);
-        assert_eq!(response.engines[0].name, "bing");
-        assert_eq!(response.engines[0].state, EngineState::Ok);
-        assert!(response.engines[0].error.is_none());
-        assert_eq!(response.results.len(), 10);
-        assert_eq!(response.results[0].position, 1);
-        assert_eq!(response.results[0].title, "Rust Programming Language");
-        assert_eq!(response.results[0].url, "https://rust-lang.org/");
-        assert_eq!(response.results[0].engine, "bing");
-        assert!(!response.results[0].content.is_empty());
-        let last = response.results.last().unwrap();
-        assert_eq!(last.position, 10);
-        assert_eq!(last.title, "The Rust Programming Language");
-        assert_eq!(last.url, "https://doc.rust-lang.org/book/");
         assert!(
-            response
-                .results
-                .iter()
-                .all(|result| !result.url.contains("bing.com"))
+            !response.engines[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("secret")
         );
-    }
-
-    #[test]
-    fn saved_page_with_no_results_reports_empty() {
-        // This page is made from the saved result page. Bing did not send it.
-        let response = response_for_page("nothing", 200, EMPTY_PAGE);
-        assert_eq!(response.results.len(), 0);
-        assert_eq!(response.engines.len(), 1);
-        assert_eq!(response.engines[0].name, "bing");
-        assert_eq!(response.engines[0].state, EngineState::Empty);
-        assert!(response.engines[0].error.is_none());
-        assert_ne!(response.engines[0].state, EngineState::Ok);
     }
 }
