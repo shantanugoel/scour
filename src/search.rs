@@ -165,7 +165,7 @@ fn box_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::bing;
+    use crate::engines::{bing, duckduckgo};
 
     /// DNS that fails before any connection, so the test makes no request.
     struct FailResolve;
@@ -341,6 +341,104 @@ mod tests {
         assert!(response.results.is_empty());
         assert_eq!(response.engines[0].state, EngineState::Empty);
         assert!(response.engines[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_403_and_429_from_any_engine_are_blocked() {
+        for status in [
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            // The reader would find a result in this body, so only the status can give `blocked`.
+            let app = axum::Router::new().route(
+                "/first",
+                axum::routing::get(move || async move { (status, "first") }),
+            );
+            let base = serve(app).await;
+            let searcher = Searcher {
+                client: test_client(),
+                engines: vec![leaked(Engine {
+                    name: "any",
+                    base_url: base,
+                    profile: wreq_util::Profile::Chrome149,
+                    request_url: first_url,
+                    read: read_body,
+                })],
+            };
+            let response = searcher.search("x").await;
+            assert_eq!(response.engines[0].state, EngineState::Blocked, "{status}");
+            assert!(response.results.is_empty(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_duckduckgo_pages_report_their_state() {
+        // See the tests in `engines::duckduckgo` for how each saved page was made.
+        let results = include_str!("../fixtures/duckduckgo/results.html");
+        let empty = include_str!("../fixtures/duckduckgo/empty.html");
+        let blocked = include_str!("../fixtures/duckduckgo/blocked.html");
+        let changed: &'static str = Box::leak(
+            results
+                .replace(r#"class="result__a""#, r#"class="result__link""#)
+                .into(),
+        );
+        let cases = [
+            (200, results, EngineState::Ok),
+            (200, empty, EngineState::Empty),
+            (200, changed, EngineState::ParseFailed),
+            (202, blocked, EngineState::Blocked),
+            (200, blocked, EngineState::Blocked),
+        ];
+        for (status, page, state) in cases {
+            let status = axum::http::StatusCode::from_u16(status).unwrap();
+            let app = axum::Router::new().route(
+                "/html/",
+                axum::routing::get(move || async move { (status, axum::response::Html(page)) }),
+            );
+            let base = serve(app).await;
+            let searcher = Searcher {
+                client: test_client(),
+                engines: vec![leaked(Engine {
+                    base_url: base,
+                    ..duckduckgo::ENGINE
+                })],
+            };
+            let response = searcher.search("rust async runtime").await;
+            assert_eq!(response.engines[0].name, "duckduckgo");
+            assert_eq!(response.engines[0].state, state, "HTTP {status}");
+            assert_eq!(
+                response.results.is_empty(),
+                state != EngineState::Ok,
+                "HTTP {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_that_does_not_answer_in_time_reports_error_not_blocked() {
+        let app = axum::Router::new().route(
+            "/first",
+            axum::routing::get(std::future::pending::<&'static str>),
+        );
+        let base = serve(app).await;
+        let client = wreq::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let searcher = Searcher {
+            client,
+            engines: vec![leaked(Engine {
+                name: "slow",
+                base_url: base,
+                profile: wreq_util::Profile::Chrome149,
+                request_url: first_url,
+                read: read_body,
+            })],
+        };
+        let response = searcher.search("x").await;
+        assert_eq!(response.engines[0].state, EngineState::Error);
+        assert!(response.results.is_empty());
     }
 
     #[tokio::test]

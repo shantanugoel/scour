@@ -78,6 +78,13 @@ mod tests {
     use super::*;
 
     const RESULTS_PAGE: &str = include_str!("../../fixtures/duckduckgo/results.html");
+    /// The page that html.duckduckgo.com sent with HTTP 202 on 2026-11-26 to one cookie-free
+    /// `Profile::Chrome149` request over IPv4 for a quoted random string. It was not changed.
+    const BLOCK_PAGE: &str = include_str!("../../fixtures/duckduckgo/blocked.html");
+    /// Constructed, not sent by DuckDuckGo: the one live request for it got `BLOCK_PAGE`.
+    /// It is `results.html` with the query changed and the result rows replaced by the
+    /// "No  results." block (two spaces), the text that DuckDuckGo puts on a page with no results.
+    const EMPTY_PAGE: &str = include_str!("../../fixtures/duckduckgo/empty.html");
 
     #[test]
     fn request_url_form_encodes_the_query_and_sets_the_region() {
@@ -151,8 +158,35 @@ mod tests {
     }
 
     #[test]
-    fn page_without_result_rows_is_empty() {
-        let html = r#"<div class="serp__results"><div id="links" class="results"></div></div>"#;
-        assert_eq!((ENGINE.read)(200, html), Page::Empty);
+    fn saved_page_without_results_is_empty() {
+        assert_eq!((ENGINE.read)(200, EMPTY_PAGE), Page::Empty);
+    }
+
+    #[test]
+    fn changed_result_markup_is_parse_failed_not_empty() {
+        // Each page is `results.html` with one part of the result markup renamed, as a redesign would do.
+        let changes = [
+            (
+                r#"class="result results_links"#,
+                r#"class="web-item results_links"#,
+            ),
+            (r#"class="result__a""#, r#"class="result__link""#),
+        ];
+        for (from, to) in changes {
+            let changed = RESULTS_PAGE.replace(from, to);
+            assert_ne!(changed, RESULTS_PAGE, "{from}");
+            assert_eq!((ENGINE.read)(200, &changed), Page::ParseFailed, "{from}");
+        }
+    }
+
+    #[test]
+    fn saved_block_page_is_blocked_for_any_status() {
+        for status in [202, 200] {
+            assert_eq!(
+                (ENGINE.read)(status, BLOCK_PAGE),
+                Page::Blocked,
+                "HTTP {status}"
+            );
+        }
     }
 }

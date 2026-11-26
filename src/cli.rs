@@ -207,6 +207,36 @@ mod tests {
     }
 
     #[test]
+    fn blocked_and_parse_failed_answers_fail_and_print_the_state() {
+        for (state, name) in [
+            (EngineState::Blocked, "blocked"),
+            (EngineState::ParseFailed, "parse_failed"),
+        ] {
+            let response = SearchResponse {
+                query: "x".to_string(),
+                results: Vec::new(),
+                engines: vec![EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state,
+                    error: None,
+                }],
+            };
+            let presented = present(&response);
+            assert!(!presented.success, "{name}");
+            assert!(presented.stdout.is_empty(), "{name}");
+            assert!(
+                presented
+                    .stderr
+                    .starts_with(&format!("scour: duckduckgo: {name}")),
+                "{}",
+                presented.stderr
+            );
+            assert!(!presented.stderr.contains("empty"), "{name}");
+            assert!(!presented.stderr.contains(" ok"), "{name}");
+        }
+    }
+
+    #[test]
     fn empty_answer_prints_empty_not_ok() {
         let response = SearchResponse {
             query: "x".to_string(),
