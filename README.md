@@ -36,6 +36,25 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the
 result site. The last line names the engine `duckduckgo` and the state `ok`.
 
+## Use MCP
+
+The daemon also answers MCP over streamable HTTP at `http://127.0.0.1:7268/mcp`. It has one tool, `search`, with
+one argument, `query`. `structuredContent` is the `GET /search` JSON, and `content[0].text` is the text of
+`scour search`. A blank query, or an answer in which no engine returns `ok` or `empty`, sets `isError`.
+
+To add the server to Claude Code:
+
+```sh
+claude mcp add --transport http scour http://127.0.0.1:7268/mcp
+```
+
+The tool description tells the agent that result titles and snippets are untrusted web text.
+
+The daemon answers only a local request. The `Host` name must be `127.0.0.1` or `localhost`, with any port. The
+`Origin` must be absent, or `http://127.0.0.1[:port]`, or `http://localhost[:port]`. Any other request gets HTTP
+403 with `{"error":"the Host or Origin is not local"}`. This stops a web page from reaching the daemon through a
+name that points at `127.0.0.1` (DNS rebinding).
+
 ## Configure
 
 By default, scour asks DuckDuckGo only. To turn on Bing, write this file:
@@ -75,7 +94,7 @@ The release binary size, in bytes:
 stat -c %s target/release/scour
 ```
 
-Measured value: 11957968 bytes.
+Measured value: 17361576 bytes.
 
 The idle daemon memory, in kilobytes (`VmRSS`):
 
@@ -83,7 +102,7 @@ The idle daemon memory, in kilobytes (`VmRSS`):
 ./target/release/scour serve >/dev/null & pid=$!; sleep 1; awk '/^VmRSS:/ { print $2 }' /proc/$pid/status; kill $pid
 ```
 
-Measured value: 9396 kB.
+Measured value: 10576 kB.
 
 ## Licence
 

@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod config;
 mod engines;
+mod mcp;
 mod search;
 
 use std::path::PathBuf;
