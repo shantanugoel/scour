@@ -62,14 +62,16 @@ impl ScourMcp {
 impl ServerHandler for ScourMcp {}
 
 fn answer(response: &SearchResponse) -> CallToolResult {
-    let mut result = CallToolResult::structured(
-        serde_json::to_value(response).expect("a search answer is JSON"),
-    );
-    result.content = vec![ContentBlock::text(crate::cli::render(response))];
     let answered = response
         .engines
         .iter()
         .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty));
+    let mut result = CallToolResult::default();
+    result
+        .content
+        .push(ContentBlock::text(crate::cli::render(response)));
+    result.structured_content =
+        Some(serde_json::to_value(response).expect("a search answer is JSON"));
     result.is_error = Some(!answered);
     result
 }

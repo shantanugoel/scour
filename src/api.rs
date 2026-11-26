@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Query, Request, State};
-use axum::http::StatusCode;
-use axum::http::{header, uri::Authority};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -80,36 +79,33 @@ async fn guard_local(request: Request, next: Next) -> Response {
 }
 
 fn is_local(request: &Request) -> bool {
-    request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<Authority>().ok())
-        .is_some_and(|authority| is_local_name(authority.host()))
-        && origin_is_local(request)
+    let headers = request.headers();
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    hosts
+        .next()
+        .is_some_and(|value| value.to_str().is_ok_and(is_local_address))
+        && hosts.next().is_none()
+        && origins
+            .next()
+            .is_none_or(|value| value.to_str().is_ok_and(is_local_origin))
+        && origins.next().is_none()
 }
 
-fn is_local_name(name: &str) -> bool {
-    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
-}
-
-fn origin_is_local(request: &Request) -> bool {
-    let Some(value) = request.headers().get(header::ORIGIN) else {
-        return true;
-    };
-    value.to_str().ok().is_some_and(is_local_origin)
+fn is_local_address(address: &str) -> bool {
+    let (host, port) = address
+        .split_once(':')
+        .map_or((address, None), |(host, port)| (host, Some(port)));
+    (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+        && port.is_none_or(|port| {
+            port.bytes().all(|byte| byte.is_ascii_digit()) && port.parse::<u16>().is_ok()
+        })
 }
 
 fn is_local_origin(origin: &str) -> bool {
-    let Some((scheme, rest)) = origin.split_once("://") else {
-        return false;
-    };
-    // An Origin has no path, query or fragment.
-    scheme.eq_ignore_ascii_case("http")
-        && !rest.contains(['/', '?', '#'])
-        && rest
-            .parse::<Authority>()
-            .is_ok_and(|authority| is_local_name(authority.host()))
+    origin.split_once("://").is_some_and(|(scheme, address)| {
+        scheme.eq_ignore_ascii_case("http") && is_local_address(address)
+    })
 }
 
 async fn get_search(
@@ -157,14 +153,14 @@ mod tests {
     }
 
     /// An engine page on this machine. The counter proves that a request went out.
-    async fn engine(status: StatusCode) -> (&'static str, Arc<AtomicUsize>) {
+    async fn engine(status: StatusCode, body: &'static str) -> (&'static str, Arc<AtomicUsize>) {
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = requests.clone();
         let app = axum::Router::new().route(
             "/engine",
             axum::routing::get(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
-                async move { (status, "Tokio") }
+                async move { (status, body) }
             }),
         );
         let (base, _) = serve(app).await;
@@ -178,10 +174,14 @@ mod tests {
     }
 
     fn read_page(_status: u16, body: &str) -> Page {
+        let body = body.trim();
+        if body.is_empty() {
+            return Page::Empty;
+        }
         Page::Results(vec![Hit {
             url: "https://tokio.rs/".to_string(),
             title: "Tokio".to_string(),
-            content: body.trim().to_string(),
+            content: body.to_string(),
         }])
     }
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_plain_json_rpc_client_lists_and_calls_the_search_tool() {
-        let (engine_base, engine_requests) = engine(StatusCode::OK).await;
+        let (engine_base, engine_requests) = engine(StatusCode::OK, "Tokio").await;
         let (base, _) = serve(router(searcher(engine_base))).await;
 
         let (status, initialized) = rpc(
@@ -312,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_blank_query_is_a_tool_error_without_an_engine_request() {
-        let (engine_base, engine_requests) = engine(StatusCode::OK).await;
+        let (engine_base, engine_requests) = engine(StatusCode::OK, "Tokio").await;
         let (base, _) = serve(router(searcher(engine_base))).await;
 
         let (status, called) = rpc(
@@ -334,26 +334,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_without_an_ok_or_empty_engine_is_a_tool_error() {
-        let (engine_base, _) = engine(StatusCode::SERVICE_UNAVAILABLE).await;
-        let (base, _) = serve(router(searcher(engine_base))).await;
+    async fn an_empty_engine_answer_succeeds_and_a_failed_answer_is_a_tool_error() {
+        let cases = [
+            (StatusCode::OK, "empty", false, "test: empty (0 results)"),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "error",
+                true,
+                "test: error: HTTP 503",
+            ),
+        ];
+        for (engine_status, state, is_error, expected_text) in cases {
+            let (engine_base, engine_requests) = engine(engine_status, "").await;
+            let (base, _) = serve(router(searcher(engine_base))).await;
 
-        let (status, called) = rpc(
-            base,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": "search", "arguments": {"query": "rust async runtime"}}
-            }),
-        )
-        .await;
-        assert_eq!(status, 200);
-        let result = &called["result"];
-        assert_eq!(result["isError"], true);
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("test: error: HTTP 503"), "{text}");
-        assert_eq!(result["structuredContent"]["engines"][0]["state"], "error");
+            let (status, called) = rpc(
+                base,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "search", "arguments": {"query": "rust async runtime"}}
+                }),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let result = &called["result"];
+            assert_eq!(result["structuredContent"]["engines"][0]["state"], state);
+            assert_eq!(
+                result["structuredContent"]["results"],
+                serde_json::json!([])
+            );
+            assert_eq!(result["isError"], is_error, "engine state {state}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(expected_text), "{text}");
+            assert_eq!(engine_requests.load(Ordering::SeqCst), 1);
+        }
     }
 
     async fn raw(address: SocketAddr, request: &str) -> (u16, String) {
@@ -372,9 +388,12 @@ mod tests {
         (status, body.to_string())
     }
 
-    fn get(path: &str, host: &str, origin: Option<&str>) -> String {
-        let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
-        if let Some(origin) = origin {
+    fn get(path: &str, hosts: &[&str], origins: &[&str]) -> String {
+        let mut request = format!("GET {path} HTTP/1.1\r\nConnection: close\r\n");
+        for host in hosts {
+            request.push_str(&format!("Host: {host}\r\n"));
+        }
+        for origin in origins {
             request.push_str(&format!("Origin: {origin}\r\n"));
         }
         request.push_str("\r\n");
@@ -383,52 +402,68 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreign_host_or_origin_is_forbidden_on_every_route() {
-        let (engine_base, engine_requests) = engine(StatusCode::OK).await;
+        let (engine_base, engine_requests) = engine(StatusCode::OK, "Tokio").await;
         let (_, address) = serve(router(searcher(engine_base))).await;
-        let local = format!("127.0.0.1:{}", address.port());
+        let local = "127.0.0.1";
+        let origin = "http://127.0.0.1";
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[]),
+            (&["evil.example"], &[]),
+            (&["evil.example@127.0.0.1"], &[]),
+            (&["127.0.0.1:"], &[]),
+            (&["localhost:evil.example"], &[]),
+            (&["localhost:+80"], &[]),
+            (&["localhost:65536"], &[]),
+            (&[local, local], &[]),
+            (&[local], &["http://evil.example"]),
+            (&[local], &["http://evil.example@127.0.0.1"]),
+            (&[local], &["http://127.0.0.1:"]),
+            (&[local], &["http://localhost:evil.example"]),
+            (&[local], &["http://localhost:80/path"]),
+            (&[local], &["https://127.0.0.1"]),
+            (&[local], &["null"]),
+            (&[local], &[origin, "http://evil.example"]),
+            (&[local], &[origin, origin]),
+        ];
 
         for path in ["/search?q=x", "/mcp", "/no-route"] {
-            let (status, body) = raw(address, &get(path, "evil.example", None)).await;
-            assert_eq!(status, 403, "a foreign Host on {path}");
-            assert!(body.contains("the Host or Origin is not local"), "{body}");
-
-            let (status, body) =
-                raw(address, &get(path, &local, Some("http://evil.example"))).await;
-            assert_eq!(status, 403, "a foreign Origin on {path}");
-            assert!(body.contains("the Host or Origin is not local"), "{body}");
-        }
-
-        for origin in ["https://127.0.0.1", "null"] {
-            let (status, _) = raw(address, &get("/search?q=x", &local, Some(origin))).await;
-            assert_eq!(status, 403, "the Origin {origin}");
+            for &(hosts, origins) in cases {
+                let (status, body) = raw(address, &get(path, hosts, origins)).await;
+                assert_eq!(
+                    status, 403,
+                    "Host {hosts:?} and Origin {origins:?} on {path}"
+                );
+                assert_eq!(body, r#"{"error":"the Host or Origin is not local"}"#);
+            }
         }
         assert_eq!(engine_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn a_local_host_on_any_port_and_no_origin_or_a_local_origin_pass() {
-        let (engine_base, engine_requests) = engine(StatusCode::OK).await;
+        let (engine_base, engine_requests) = engine(StatusCode::OK, "Tokio").await;
         let (_, address) = serve(router(searcher(engine_base))).await;
         let local = format!("127.0.0.1:{}", address.port());
+        let local_name = format!("localhost:{}", address.port());
+        let local_origin = format!("http://{local}");
         let cases = [
-            (format!("127.0.0.1:{}", address.port()), None),
-            (format!("localhost:{}", address.port()), None),
-            (local.clone(), Some(format!("http://{local}"))),
-            (
-                "localhost:1234".to_string(),
-                Some("http://localhost:5173".to_string()),
-            ),
+            (local.as_str(), None),
+            (local_name.as_str(), None),
+            (local.as_str(), Some(local_origin.as_str())),
+            ("localhost:1234", Some("http://localhost:5173")),
+            ("127.0.0.1", Some("http://127.0.0.1")),
         ];
         for (host, origin) in &cases {
-            let (status, body) = raw(address, &get("/search?q=x", host, origin.as_deref())).await;
+            let (status, body) =
+                raw(address, &get("/search?q=x", &[host], origin.as_slice())).await;
             assert_eq!(status, 200, "Host {host} and Origin {origin:?}: {body}");
         }
-        assert_eq!(engine_requests.load(Ordering::SeqCst), 4);
+        assert_eq!(engine_requests.load(Ordering::SeqCst), cases.len());
 
-        let (status, _) = raw(address, &get("/no-route", &local, None)).await;
+        let (status, _) = raw(address, &get("/no-route", &[&local], &[])).await;
         assert_eq!(status, 404);
 
-        let (status, _) = raw(address, &get("/mcp", &local, None)).await;
+        let (status, _) = raw(address, &get("/mcp", &[&local], &[])).await;
         assert_eq!(status, 405);
     }
 }

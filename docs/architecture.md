@@ -51,12 +51,14 @@ flowchart LR
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
-  `{query: string}`. `tools/call` returns `structuredContent` with the `GET /search` JSON, `content[0].text` with
-  the same text as `scour search`, and `isError: true` for a blank query or when no engine is `ok` or `empty`.
+  `{query: string}`. For a search answer, `tools/call` returns the `GET /search` JSON in `structuredContent` and
+  the `scour search` text in `content[0].text`. A blank query sets `isError: true` and returns only the error
+  message in `content[0].text`. A search answer sets `isError: true` when no engine is `ok` or `empty`.
   A blank query sends no engine request. The server reports `serverInfo` as `scour`.
 - **Local-only guard.** One `Router::layer` wraps every route, including `/mcp`, `/search` and an unknown path. A
-  request passes only when the `Host` name is `127.0.0.1` or `localhost` (any port) and the `Origin` is absent or
-  `http://127.0.0.1[:port]` or `http://localhost[:port]`. Any other request gets HTTP 403 with
+  request requires one `Host` header with `127.0.0.1[:port]` or `localhost[:port]`. An optional `Origin` header
+  must appear at most once and use `http://127.0.0.1[:port]` or `http://localhost[:port]`. Each optional port
+  must contain only digits and have a value from 0 to 65535. Any other request gets HTTP 403 with
   `{"error":"the Host or Origin is not local"}`. The guard stops a web page from reaching the daemon through a
   name that points at `127.0.0.1` (DNS rebinding). `rmcp` also checks the `Host` by default; our layer runs first
   and answers in the same way on every route.
