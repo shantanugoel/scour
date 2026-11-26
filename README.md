@@ -51,9 +51,10 @@ Or start the daemon with a file:
 ./target/release/scour serve --config /path/to/config.toml
 ```
 
-The `engines` list accepts `duckduckgo` and `bing`. The daemon stops with exit code 1 for an unknown key, an unknown
-or duplicate engine name, an empty list, or a missing `--config` file. A TOML error prints the parser message and
-the line number, not the line text, so a secret in the file does not appear in the terminal.
+The `engines` list accepts `duckduckgo` and `bing`. Invalid TOML stops the daemon with exit code 1. The same exit
+code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing `--config` file. A
+TOML error prints the parser message and the line number, not the line text. Thus a secret in the file does not
+appear in the terminal.
 
 ## Check
 

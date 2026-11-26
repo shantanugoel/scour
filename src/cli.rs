@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::api::{ADDR, EngineState, SearchResponse};
 
-/// Longer than the 10 s Bing timeout, so the daemon can answer first.
-const DAEMON_WAIT: Duration = Duration::from_secs(15);
+/// Two engines can each take the 10 s search timeout, so wait longer than 20 s.
+const DAEMON_WAIT: Duration = Duration::from_secs(25);
 
 pub async fn search(query: &str) -> ExitCode {
     let endpoint = format!("http://{ADDR}/search");

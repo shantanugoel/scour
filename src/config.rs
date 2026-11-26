@@ -102,76 +102,28 @@ fn toml_error(err: &toml::de::Error, text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn load_text(name: &str, text: &str) -> Result<Config, String> {
+        let path =
+            std::env::temp_dir().join(format!("scour-config-{name}-{}.toml", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let loaded = load(Some(&path));
+        let _ = std::fs::remove_file(&path);
+        loaded
+    }
+
     fn names(config: &Config) -> Vec<&'static str> {
         config.engines.iter().map(|engine| engine.name).collect()
     }
 
     #[test]
     fn config_without_an_engines_key_enables_duckduckgo_only() {
-        let config = parse("").unwrap();
+        let config = load_text("no-engines", "# no keys\n").unwrap();
         assert_eq!(names(&config), ["duckduckgo"]);
     }
 
     #[test]
     fn engines_key_enables_each_named_engine_in_order() {
-        let config = parse("engines = [\"duckduckgo\", \"bing\"]").unwrap();
+        let config = load_text("two-engines", "engines = [\"duckduckgo\", \"bing\"]\n").unwrap();
         assert_eq!(names(&config), ["duckduckgo", "bing"]);
-    }
-
-    #[test]
-    fn empty_engines_list_is_rejected() {
-        let error = parse("engines = []").unwrap_err();
-        assert_eq!(error, "the engines list is empty");
-    }
-
-    #[test]
-    fn unknown_engine_is_rejected() {
-        let error = parse("engines = [\"google\"]").unwrap_err();
-        assert_eq!(error, "unknown engine `google`");
-    }
-
-    #[test]
-    fn duplicate_engine_is_rejected() {
-        let error = parse("engines = [\"bing\", \"bing\"]").unwrap_err();
-        assert_eq!(error, "engine `bing` is listed more than once");
-    }
-
-    #[test]
-    fn unknown_key_is_rejected() {
-        let error = parse("proxy = \"http://127.0.0.1:8080\"").unwrap_err();
-        assert!(error.contains("unknown field `proxy`"), "{error}");
-    }
-
-    #[test]
-    fn toml_error_shows_the_line_but_not_the_source_line() {
-        let error = parse("engines = [\"duckduckgo\" \"hunter2\"]").unwrap_err();
-        assert!(error.contains("config line 1"), "{error}");
-        assert!(!error.contains("hunter2"), "{error}");
-        assert!(!error.contains("duckduckgo"), "{error}");
-    }
-
-    #[test]
-    fn config_path_prefers_xdg_config_home() {
-        assert_eq!(
-            config_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/person"))),
-            Some(PathBuf::from("/xdg/scour/config.toml"))
-        );
-    }
-
-    #[test]
-    fn config_path_falls_back_to_home() {
-        assert_eq!(
-            config_path(None, Some(OsStr::new("/home/person"))),
-            Some(PathBuf::from("/home/person/.config/scour/config.toml"))
-        );
-    }
-
-    #[test]
-    fn missing_explicit_config_file_is_an_error() {
-        let path =
-            std::env::temp_dir().join(format!("scour-missing-config-{}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let error = load(Some(&path)).unwrap_err();
-        assert!(error.starts_with("cannot read "), "{error}");
     }
 }

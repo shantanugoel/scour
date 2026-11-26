@@ -1,4 +1,6 @@
-use super::{Engine, Hit, Page};
+use super::{Engine, Hit, Page, accepted_result, is_host, plain_text, selector};
+
+const SITE: &str = "duckduckgo.com";
 
 pub const ENGINE: Engine = Engine {
     name: "duckduckgo",
@@ -63,35 +65,12 @@ fn parse(html: &str) -> Vec<Hit> {
 fn result_url(href: &str) -> Option<String> {
     let base = url::Url::parse("https://duckduckgo.com").ok()?;
     let parsed = base.join(href).ok()?;
-    if !parsed.host_str().is_some_and(is_duckduckgo_host) {
-        return accepted_result(&parsed);
+    if !parsed.host_str().is_some_and(|host| is_host(host, SITE)) {
+        return accepted_result(&parsed, SITE);
     }
     let encoded = parsed.query_pairs().find(|(key, _)| key == "uddg")?.1;
     let destination = url::Url::parse(&encoded).ok()?;
-    accepted_result(&destination)
-}
-
-fn accepted_result(url: &url::Url) -> Option<String> {
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return None;
-    }
-    if is_duckduckgo_host(url.host_str()?) {
-        return None;
-    }
-    Some(url.to_string())
-}
-
-fn is_duckduckgo_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "duckduckgo.com" || host.ends_with(".duckduckgo.com")
-}
-
-fn plain_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn selector(source: &str) -> scraper::Selector {
-    scraper::Selector::parse(source).expect("selector")
+    accepted_result(&destination, SITE)
 }
 
 #[cfg(test)]

@@ -115,7 +115,7 @@ fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
 
 pub fn http_client() -> wreq::Result<wreq::Client> {
     // wreq follows no redirects by default, and it reads the system proxy.
-    // This issue has no proxy. A Bing answer can be a redirect.
+    // scour has no proxy setting yet, and a Bing answer can be a redirect.
     wreq::Client::builder()
         .timeout(TIMEOUT)
         .redirect(wreq::redirect::Policy::limited(10))

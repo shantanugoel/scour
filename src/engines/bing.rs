@@ -1,7 +1,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use super::{Engine, Hit, Page};
+use super::{Engine, Hit, Page, accepted_result, is_host, plain_text, selector};
+
+const SITE: &str = "bing.com";
 
 pub const ENGINE: Engine = Engine {
     name: "bing",
@@ -67,8 +69,8 @@ fn parse(html: &str) -> Vec<Hit> {
 fn result_url(href: &str) -> Option<String> {
     let base = url::Url::parse("https://www.bing.com").ok()?;
     let parsed = base.join(href).ok()?;
-    if !parsed.host_str().is_some_and(is_bing_host) {
-        return accepted_result(&parsed);
+    if !parsed.host_str().is_some_and(|host| is_host(host, SITE)) {
+        return accepted_result(&parsed, SITE);
     }
     let encoded = parsed.query_pairs().find(|(key, _)| key == "u")?.1;
     let encoded = encoded.strip_prefix("a1")?;
@@ -76,30 +78,7 @@ fn result_url(href: &str) -> Option<String> {
     let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     let destination = url::Url::parse(text.trim()).ok()?;
-    accepted_result(&destination)
-}
-
-fn accepted_result(url: &url::Url) -> Option<String> {
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return None;
-    }
-    if is_bing_host(url.host_str()?) {
-        return None;
-    }
-    Some(url.to_string())
-}
-
-fn is_bing_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "bing.com" || host.ends_with(".bing.com")
-}
-
-fn plain_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn selector(source: &str) -> scraper::Selector {
-    scraper::Selector::parse(source).expect("selector")
+    accepted_result(&destination, SITE)
 }
 
 #[cfg(test)]

@@ -127,7 +127,6 @@ solver plugin.
 
 | Question | How we answer it (a spike, the owner, a milestone) | What waits on it |
 | --- | --- | --- |
-| Which cheap engine other than DuckDuckGo gives results that match the query to a paced `wreq` client: Startpage, Qwant, Yahoo, Ecosia, or Bing with a corrected request? Why do Bing results not match the query? | A spike ([#14](https://github.com/shantanugoel/scour/issues/14)), the first slice of milestone 1 | The default engine list of milestone 1, and the last step of its demo |
 | How fast, and for how long, can scour ask DuckDuckGo before a block? Measured only: 1 request in 30 to 90 seconds for 60 minutes. | Milestone 1: the plan sets a careful default pace, and the daily count shows the limit in use | The default pace and the daily limit of DuckDuckGo |
 | How does a person reach the live link when Chrome runs in Docker, with the CDP port on the loopback of the container? Which address does the daemon listen on in the container? Each answer can make the localhost invariant weaker. | The owner, in the plan of milestone 2 | The `scour:browser` image, and the handoff in Docker |
 | Does the local inspector of Chrome work with a narrow `--remote-allow-origins` value? Each spike run used `*`. | Milestone 2 | The start flags of Chrome |
