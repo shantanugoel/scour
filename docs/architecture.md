@@ -8,7 +8,7 @@ The browser is headful Chrome on Xvfb (a virtual display). It runs as a child pr
 through CDP (the Chrome DevTools Protocol) with `chromiumoxide`.
 
 The main reason for this shape: blocks come mostly from the IP and from the fingerprint, not from the tool. Thus
-most queries use the cheap tier. The release binary is 17361576 bytes. The idle daemon uses 10.3 MiB of memory.
+most queries use the cheap tier. The release binary is 17657880 bytes. The idle daemon uses 11.0 MiB of memory.
 Only a Google query pays for a browser.
 
 ## Context
@@ -19,6 +19,9 @@ flowchart LR
   cli[scour CLI] -- HTTP JSON --> d
   d -- HTTPS, IPv4, default --> ddg[DuckDuckGo]
   d -- HTTPS, IPv4, opt-in --> bing[Bing]
+  d -. optional .-> p[Global proxy]
+  p --> ddg
+  p --> bing
   d -. planned, opt-in .-> eng[Brave, Mojeek]
   d -. CDP, planned .-> br[Headful Chrome on Xvfb] --> g[Google]
   d -. challenge, planned .-> sol[Person through the local inspector link, or solver plugin]
@@ -34,7 +37,7 @@ flowchart LR
 | Parallel HTTP search | Starts one task per enabled engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
 | Cascade | Selects the engines for a query. It sends each HTTP engine through the HTTP tier and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. | Rust | planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
-| HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
+| HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
@@ -110,6 +113,9 @@ flowchart LR
   can add `bing`. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
   The same exit code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing
   `--config` file. A TOML error shows a redacted parser message and the line number.
+  The optional `proxy` key accepts an HTTP, SOCKS5, or SOCKS5H URL.
+  An invalid proxy URL stops startup with exit code 1. The start line shows only the proxy scheme, host and port.
+  Failed proxy connections return `error`. The engine client makes no direct fallback request.
   For local tests, `[testing].rest_seconds` sets a positive base duration.
   `[testing.base_urls]` maps enabled engine names to HTTP or HTTPS URLs. Unknown and disabled engine keys fail at startup.
   The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
@@ -119,14 +125,15 @@ flowchart LR
   Each engine has its own mutex. The code releases it before any wait or network request.
   The browser profile is planned. The daemon will delete the profile when the browser stops.
   The `GOOGLE_ABUSE_EXEMPTION` cookie lives only in that profile, so a browser stop ends the solved session.
-- **Between the parts.** The CLI talks to the daemon with HTTP JSON. The daemon does not talk to a browser yet.
+- **Between the parts.** The CLI talks to the daemon directly with HTTP JSON and bypasses all proxies.
+  The daemon does not talk to a browser yet.
   That path is CDP over WebSocket on `127.0.0.1`, and it is planned. A solver plugin is planned for after the first release. It
   would use JSON on stdin and stdout, or a JSON POST.
 
 ## Choices
 
 - **Rust.** `wreq-util` has current Chrome, Firefox and Safari TLS profiles in pure Rust. The release binary is
-  17361576 bytes and the idle daemon uses 10.3 MiB of memory. A static musl build with `wreq` works: the engine
+  17657880 bytes and the idle daemon uses 11.0 MiB of memory. A static musl build with `wreq` works: the engine
   spike binary was 8.2 MB, with a peak of 28.8 MiB. We did not use Go, because its fingerprint client
   (`tls-client`) replaces `net/http` and its HTTP/2 layer has no licence file; `chromedp` is better than the Rust
   CDP clients, but the browser is a separate process in any language. We did not use Zig, because it has no library
@@ -187,7 +194,9 @@ flowchart LR
   The explicit no-results marker lets the DuckDuckGo reader report `parse_failed` when result markup changes.
 - **A browser only for browser-only engines.** The planned cascade will rest a blocked HTTP engine.
   A browser on the same IP gets the same block.
-- **IPv4 only.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
+- **IPv4 for local DNS.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
+  Direct engine connections and `socks5://` use the local IPv4-only resolver.
+  With `http://` and `socks5h://`, the proxy resolves engine hostnames and chooses IPv4 or IPv6.
 - **State in memory.** This is the smallest store that works for one daemon. We did not use SQLite or a file. Add
   one if restarts reset the daily limits too often.
 - **The CLI uses the JSON API, not an MCP client.** `curl` and SearXNG clients can use the same endpoint. The CLI

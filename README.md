@@ -115,6 +115,23 @@ The `engines` list accepts `duckduckgo` and `bing`. Invalid TOML stops the daemo
 code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing `--config` file.
 A TOML error shows a redacted parser message and the line number.
 
+Set the optional `proxy` key to send all engine requests through one proxy.
+
+```toml
+proxy = "http://127.0.0.1:8080"
+```
+
+Use an `http://`, `socks5://`, or `socks5h://` URL with a host.
+The default ports are 80 for HTTP and 1080 for SOCKS5.
+For authentication, put the username and password before the host in the URL, with special characters percent-encoded.
+The daemon prints only the proxy scheme, host and port at startup.
+An invalid proxy URL stops startup with exit code 1.
+If the proxy fails, the engine reports `error` and the daemon makes no direct request.
+
+With `socks5://`, scour resolves engine hostnames locally and uses IPv4.
+With `http://` and `socks5h://`, the proxy resolves engine hostnames and chooses IPv4 or IPv6.
+The CLI connects to the local daemon directly, regardless of the config or environment proxy settings.
+
 For local testing, set a positive base rest duration in seconds and point enabled engines at test servers.
 
 ```toml
@@ -146,15 +163,15 @@ The release binary size, in bytes:
 stat -c %s target/release/scour
 ```
 
-Measured value: 17361576 bytes.
+The measured binary size is 17657880 bytes.
 
 The idle daemon memory, in kilobytes (`VmRSS`):
 
 ```sh
-./target/release/scour serve >/dev/null & pid=$!; sleep 1; awk '/^VmRSS:/ { print $2 }' /proc/$pid/status; kill $pid
+./target/release/scour serve --config /dev/null >/dev/null & pid=$!; sleep 1; awk '/^VmRSS:/ { print $2 }' /proc/$pid/status; kill $pid
 ```
 
-Measured value: 10576 kB.
+The median of five starts is 11248 kB.
 
 ## Licence
 
