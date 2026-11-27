@@ -36,6 +36,18 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the
 result site. The last line names the engine `duckduckgo` and the state `ok`.
 
+The CLI, JSON API and MCP report a state for each engine.
+
+| State | Meaning |
+| --- | --- |
+| `ok` | The engine returned results. |
+| `empty` | DuckDuckGo showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
+| `blocked` | The engine returned HTTP 403 or 429, or DuckDuckGo showed a challenge page at any HTTP status. |
+| `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. |
+| `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
+
+The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns `ok` or `empty`.
+
 ## Use MCP
 
 The daemon also answers MCP over streamable HTTP at `http://127.0.0.1:7268/mcp`. It has one tool, `search`, with

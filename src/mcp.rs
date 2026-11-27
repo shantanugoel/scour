@@ -8,7 +8,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::api::{EngineState, SearchResponse};
+use crate::api::SearchResponse;
 use crate::search::Searcher;
 
 /// The MCP transport handler. Each HTTP request builds a new tool handler from this factory.
@@ -62,16 +62,12 @@ impl ScourMcp {
 impl ServerHandler for ScourMcp {}
 
 fn answer(response: &SearchResponse) -> CallToolResult {
-    let answered = response
-        .engines
-        .iter()
-        .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty));
     let mut result = CallToolResult::default();
     result
         .content
         .push(ContentBlock::text(crate::cli::render(response)));
     result.structured_content =
         Some(serde_json::to_value(response).expect("a search answer is JSON"));
-    result.is_error = Some(!answered);
+    result.is_error = Some(!response.has_answer());
     result
 }

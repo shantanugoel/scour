@@ -20,6 +20,14 @@ pub struct SearchResponse {
     pub engines: Vec<EngineStatus>,
 }
 
+impl SearchResponse {
+    pub(crate) fn has_answer(&self) -> bool {
+        self.engines
+            .iter()
+            .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultItem {
     pub url: String,
@@ -34,6 +42,8 @@ pub struct ResultItem {
 pub enum EngineState {
     Ok,
     Empty,
+    Blocked,
+    ParseFailed,
     Error,
 }
 
@@ -175,8 +185,11 @@ mod tests {
 
     fn read_page(_status: u16, body: &str) -> Page {
         let body = body.trim();
-        if body.is_empty() {
-            return Page::Empty;
+        match body {
+            "" => return Page::Empty,
+            "block page" => return Page::Blocked,
+            "changed markup" => return Page::ParseFailed,
+            _ => {}
         }
         Page::Results(vec![Hit {
             url: "https://tokio.rs/".to_string(),
@@ -336,16 +349,44 @@ mod tests {
     #[tokio::test]
     async fn an_empty_engine_answer_succeeds_and_a_failed_answer_is_a_tool_error() {
         let cases = [
-            (StatusCode::OK, "empty", false, "test: empty (0 results)"),
+            (
+                StatusCode::OK,
+                "",
+                "empty",
+                false,
+                "test: empty (0 results)",
+            ),
             (
                 StatusCode::SERVICE_UNAVAILABLE,
+                "",
                 "error",
                 true,
                 "test: error: HTTP 503",
             ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "",
+                "blocked",
+                true,
+                "test: blocked",
+            ),
+            (
+                StatusCode::ACCEPTED,
+                "block page",
+                "blocked",
+                true,
+                "test: blocked",
+            ),
+            (
+                StatusCode::OK,
+                "changed markup",
+                "parse_failed",
+                true,
+                "test: parse_failed",
+            ),
         ];
-        for (engine_status, state, is_error, expected_text) in cases {
-            let (engine_base, engine_requests) = engine(engine_status, "").await;
+        for (engine_status, body, state, is_error, expected_text) in cases {
+            let (engine_base, engine_requests) = engine(engine_status, body).await;
             let (base, _) = serve(router(searcher(engine_base))).await;
 
             let (status, called) = rpc(

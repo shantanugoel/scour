@@ -35,7 +35,7 @@ flowchart LR
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
-| Engine state | DuckDuckGo and Bing report `ok` (1 or more results), `empty` (HTTP 200 and 0 results) or `error` (the request failed). `blocked`, `parse_failed`, the rest timer, the rate limit and the daily count are planned. When the only default engine rests, the answer has no results, the state `blocked` and the rest time. | Rust, in memory | built for DuckDuckGo and Bing |
+| Engine state | Each engine reports the outcome of its request. DuckDuckGo recognizes challenge and no-results pages. Rest timers, rate limits and daily counts are planned. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike. | Rust tests | built for DuckDuckGo and Bing |
 | Packaging | Has two Docker images. `scour` has only the binary and the cheap engines. `scour:browser` adds Chrome and Xvfb. The installed Chromium of the browser spike is 437 MB, so `scour:browser` is several hundred MB. The image size is not measured yet. On a Linux host without Docker, the user installs Chrome and Xvfb, and sets the path of Chrome. | Docker, static musl binary | planned |
@@ -48,6 +48,13 @@ flowchart LR
   planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
   compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
   `format=json` still works.
+- **Engine state.** HTTP 403 and 429 give `blocked` for any engine. For other statuses, the page reader can
+  identify a block from the body. DuckDuckGo challenge pages give `blocked` at any status. Any remaining
+  non-200 response gives `error` with `HTTP <n>`. Network failures and timeouts also give `error`.
+  On HTTP 200, parsed results give `ok`. A DuckDuckGo no-results marker gives `empty`. Unrecognized
+  DuckDuckGo pages give `parse_failed`. Bing reports `empty` when its parser finds no results on HTTP 200.
+  The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns
+  `ok` or `empty`.
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
@@ -108,8 +115,8 @@ flowchart LR
   Headful Chrome matched 58% on 2 of 3 queries, so the client causes the mismatch. Brave gave HTTP 429 with a
   CAPTCHA, Mojeek gave HTTP 403, and Startpage, Qwant, Yahoo and Ecosia gave no results. We did not keep Bing as a
   default, because a result that does not match the query is worse than no result: the agent cannot see the
-  difference. One default engine is a risk: when it rests, the answer is `blocked` with no results. The pace and
-  daily limits keep the risk small.
+  difference. When the only enabled engine reports a block, the answer has no results. The planned pace and
+  daily limits will reduce the chance of a block.
 - **The CDP client in the daemon.** `chromiumoxide` drives Chrome through all steps of a Google search, so
   `headless_chrome` is not necessary. A CDP endpoint is the replaceable boundary: a user can give the CDP URL of
   another browser. The handoff link comes from the same CDP server.
@@ -152,11 +159,10 @@ flowchart LR
 - **One proxy, no rotation.** A user on a server with a flagged datacenter IP can send requests through a home or
   residential proxy. We did not build a rotating pool, because it needs its own health checks and it is the start
   of a scraping service.
-- **Health from the parsed result count.** A page with HTTP 200 and 0 results is `empty`, not `ok`. A failed
-  request is `error`. `parse_failed` is planned, so a page the parser cannot read is `empty` until then. We did
-  not use the HTTP status alone, because silent empty pages stopped most earlier projects.
-- **A browser only for browser-only engines.** A blocked HTTP engine rests. We did not send it to the browser,
-  because the research showed that a browser on a blocked IP gets the same block.
+- **Health from the response status and body.** A DuckDuckGo challenge can arrive with HTTP 200 or 202.
+  The explicit no-results marker lets the DuckDuckGo reader report `parse_failed` when result markup changes.
+- **A browser only for browser-only engines.** The planned cascade will rest a blocked HTTP engine.
+  A browser on the same IP gets the same block.
 - **IPv4 only.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
 - **State in memory.** This is the smallest store that works for one daemon. We did not use SQLite or a file. Add
   one if restarts reset the daily limits too often.

@@ -75,10 +75,7 @@ fn present(response: &SearchResponse) -> Presented {
             result.position, result.title, result.url, result.content
         ));
     }
-    let success = response
-        .engines
-        .iter()
-        .any(|engine| matches!(engine.state, EngineState::Ok | EngineState::Empty));
+    let success = response.has_answer();
     if !stdout.is_empty() && success {
         stdout.push('\n');
     }
@@ -94,6 +91,12 @@ fn present(response: &SearchResponse) -> Presented {
             }
             EngineState::Empty => {
                 stdout.push_str(&format!("{}: empty ({count} results)\n", engine.name));
+            }
+            EngineState::Blocked => {
+                stderr.push_str(&format!("scour: {}: blocked\n", engine.name));
+            }
+            EngineState::ParseFailed => {
+                stderr.push_str(&format!("scour: {}: parse_failed\n", engine.name));
             }
             EngineState::Error => {
                 let message = engine.error.as_deref().unwrap_or("error");
@@ -204,6 +207,36 @@ mod tests {
         );
         assert!(!presented.stderr.contains("ok"));
         assert!(!presented.stderr.contains("empty"));
+    }
+
+    #[test]
+    fn blocked_and_parse_failed_answers_fail_and_print_the_state() {
+        for (state, name) in [
+            (EngineState::Blocked, "blocked"),
+            (EngineState::ParseFailed, "parse_failed"),
+        ] {
+            let response = SearchResponse {
+                query: "x".to_string(),
+                results: Vec::new(),
+                engines: vec![EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state,
+                    error: None,
+                }],
+            };
+            let presented = present(&response);
+            assert!(!presented.success, "{name}");
+            assert!(presented.stdout.is_empty(), "{name}");
+            assert!(
+                presented
+                    .stderr
+                    .starts_with(&format!("scour: duckduckgo: {name}")),
+                "{}",
+                presented.stderr
+            );
+            assert!(!presented.stderr.contains("empty"), "{name}");
+            assert!(!presented.stderr.contains(" ok"), "{name}");
+        }
     }
 
     #[test]
