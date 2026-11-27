@@ -40,12 +40,12 @@ flowchart LR
 | JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. Planned: `GET /search` accepts the same `engines` list as MCP, and `scour search --engines duckduckgo,bing@browser "q"` sends it. | `axum`, `wreq` | built; `engines` planned |
 | Parallel HTTP search | Starts one task per enabled engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
 | Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. The cascade sends `http` engines through the HTTP tier and `browser` engines through the browser tier. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | planned |
-| Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned as a browser-only engine. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. Planned: each engine has two methods, `http` and `browser`. The struct keeps one `request_url` and one `read`. `profile` becomes `http: Option<wreq_util::Profile>`, and `None` means the engine has no `http` method (Google). The `browser` method loads the same `request_url` in a tab and runs the same `read` on the HTML of the page after the load. `read` can also give `Page::Challenge(kind)` for a challenge page. Assumed: a direct `/search?q=` load is enough for Bing, because 2 of 3 direct loads in spike #14 gave matching results. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Add it only if a direct load fails on most queries. | `scraper` | built for DuckDuckGo and Bing; `browser` method planned |
+| Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned as a browser-only engine. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. Planned: each engine has two methods, `http` and `browser`. The struct keeps one `request_url` and one `read`. `profile` becomes `http: Option<wreq_util::Profile>`, and `None` means the engine has no `http` method (Google). The `browser` method loads the same `request_url` in a tab and runs the same `read` on the HTML of the page after the load. `read` can also give `Page::Challenge(kind)` for a challenge page. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo and Bing; `browser` method planned |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Rendered`. `Rendered` holds the HTTP status of the main document, the HTML of the page after the load, and the tab. The engine `read` decides whether the page is a challenge, because each saved Bing result page also loads `challenges.cloudflare.com`. The tier serves every `browser` engine from one Chrome and one profile. Each query opens a new tab and closes it after `read`. A fixed number of query tabs can be open at a time; other browser queries wait for a free tab (`tokio::sync::Semaphore`). The wait counts as part of the send. A challenge tab stays open in the challenge queue and does not use a query slot. The tier starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Planned: the `http` and `browser` methods of an engine share this one state. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
-| Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike, and the saved headful Bing result and Turnstile pages from spike #14. | Rust tests | built for DuckDuckGo and Bing |
+| Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike, and the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo and Bing |
 | Packaging | Has two Docker images. `scour` has only the binary and the cheap engines. `scour:browser` adds Chrome and Xvfb. The installed Chromium of the browser spike is 437 MB, so `scour:browser` is several hundred MB. The image size is not measured yet. On a Linux host without Docker, the user installs Chrome and Xvfb, and sets the path of Chrome. | Docker, static musl binary | planned |
 
 ## Data
@@ -132,7 +132,9 @@ flowchart LR
     tab. The cookie expires approximately 3 hours after the solve. A URL that is no longer `/sorry/` is not enough,
     because the tab can go to a wrong page.
   - For another engine, the done signal is a page in the tab that the engine `read` gives as results or `empty`.
-    For Bing this is assumed, not tested.
+    For Bing, the owner cleared Turnstile through the live link in 10 s (#31). The widget left the page, the tab
+    URL stayed `/search?q=...`, and `bing::read` gave results. Bing set no Cloudflare cookie, so `expires_at` of a
+    Bing challenge has no cookie to come from. Milestone 2 sets it.
   - After the done signal, the challenge leaves `challenges[]`, and the rest of that engine ends. The agent calls
     `search` again, and the browser session gives results.
 - **Configuration.** One TOML file holds the enabled engines. The default path is `$XDG_CONFIG_HOME/scour/config.toml`,
@@ -197,8 +199,9 @@ flowchart LR
   binary approximately 70 MB, a V8 crash stops the daemon, and Obscura got no Google results.
 - **Cheap HTTP engines by default, Google opt-in.** DuckDuckGo answered each paced query in a median time of
   approximately 0.7 s. Google gave no results to raw HTTP or to replayed browser cookies. We did not use the browser
-  for all engines, because headful Chrome on Xvfb used 1.7 to 2.0 GiB of peak memory and 3 to 11 s for each
-  Google query in the spikes.
+  for all engines, because headful Chrome on Xvfb used a peak PSS of 696 MiB and an idle PSS of 551 MiB (#32),
+  and 3 to 11 s for each Google query in the spikes. PSS (proportional set size) counts each shared page one time.
+  The 1.7 to 2.0 GiB of the browser spike was a sum of `VmRSS`, which counts shared pages one time for each process.
 - **Avoid and hand off. No automatic solver in the core.** The daemon rests the engine, uses other engines and slows
   down. Then it gives the CAPTCHA to a person through a live link. An external solver plugin is planned for after the
   first release. We did not put
@@ -225,10 +228,11 @@ flowchart LR
   The explicit no-results marker lets the DuckDuckGo reader report `parse_failed` when result markup changes.
 - **The method of each engine comes from the config or the query (planned).** The config sets the default method.
   An agent can set `@browser` or `@http` for one query. Google has only the `browser` method.
-  - Reason: Bing over plain HTTP gave 0 of 238 matching results. The same URL in headful Chrome matched 57.9% on
-    2 of 3 queries.
-  - The browser is not the default, because headful Chrome used 1.7 to 2.0 GiB of peak memory and 3 to 11 s for
-    each query.
+  - Reason: Bing over plain HTTP gave 0 of 238 matching results, and Google has no `http` method. A person can
+    send an engine through the browser when its HTTP answers are bad. In headful Chrome, Bing was not stable:
+    spike #31 got Turnstile and then off-topic results, and spike #32 got results on 6 of 6 queries.
+  - The browser is not the default, because headful Chrome used a peak PSS of 696 MiB and 3 to 11 s for each
+    query.
   - We did not switch an engine from HTTP to the browser after a block. A browser on the same IP gets the same
     block, and the switch would spend the engine's budget two times.
   - We did not switch on a mismatch either. Bing returns HTTP 200 with unrelated results, so scour cannot see
@@ -247,7 +251,11 @@ flowchart LR
   needs a separate browser with a temporary profile, so agent searches never use the person's Google or Bing
   account. It also needs an extension, a pairing step and a second tool. Its way to stay hidden is worth copying if
   Google detects `chromiumoxide`: it turns on no CDP domain that a page can detect, and runs its code in isolated
-  worlds. Ardia, a Chromium fork driven over a Unix socket with no CDP port, is tested in spike #32.
+  worlds.
+- **No Ardia as the browser.** Ardia is a Chromium fork with a Unix control socket. The goal was a browser with no
+  CDP port. In spike #32, Ardia 0.2.49 turned off its control socket when its token server could not bind TCP. So
+  the socket does not remove a port. Its search results and memory were not measured. Chrome stays, and a person can
+  still connect another browser through a CDP URL.
 - **IPv4 for local DNS.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
   Direct engine connections and `socks5://` use the local IPv4-only resolver.
   With `http://` and `socks5h://`, the proxy resolves engine hostnames and chooses IPv4 or IPv6.
