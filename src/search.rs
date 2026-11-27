@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 use url::Url;
 
@@ -72,36 +74,53 @@ impl Searcher {
         Self { client, engines }
     }
 
-    pub async fn search(&self, query: &str) -> SearchResponse {
+    pub async fn search(self: &Arc<Self>, query: &str) -> SearchResponse {
+        let query = Arc::<str>::from(query);
+        let mut tasks = JoinSet::new();
+        for index in 0..self.engines.len() {
+            let searcher = self.clone();
+            let query = query.clone();
+            tasks.spawn(async move {
+                let slot = &searcher.engines[index];
+                let (answer, ready_at) = searcher.search_engine(slot, &query).await;
+                let status = EngineStatus {
+                    name: slot.engine.name.to_string(),
+                    state: answer.state,
+                    daily_count: slot
+                        .limits
+                        .lock()
+                        .expect("engine limits")
+                        .daily_count(Instant::now()),
+                    daily_limit: DAILY_LIMIT,
+                    error: answer.error,
+                    ready_at: ready_at.map(format_deadline),
+                };
+                (index, status, answer.hits.unwrap_or_default().into_iter())
+            });
+        }
+        let mut answers = tasks.join_all().await;
+        answers.sort_unstable_by_key(|(index, _, _)| *index);
+        let (engines, mut hits): (Vec<_>, Vec<_>) = answers
+            .into_iter()
+            .map(|(_, status, hits)| (status, hits))
+            .unzip();
+
         let mut results = Vec::new();
-        let mut engines = Vec::with_capacity(self.engines.len());
-        for slot in &self.engines {
-            let engine = slot.engine;
-            let (answer, ready_at) = self.search_engine(slot, query).await;
-            if let Some(hits) = answer.hits {
-                for hit in hits {
-                    let position = (results.len() + 1) as u32;
+        let mut seen = HashSet::new();
+        let ranks = hits.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
+        for _ in 0..ranks {
+            for (engine, hits) in engines.iter().zip(&mut hits) {
+                let Some(hit) = hits.next() else { continue };
+                if seen.insert(hit.url.clone()) {
                     results.push(ResultItem {
                         url: hit.url,
                         title: hit.title,
                         content: hit.content,
-                        engine: engine.name.to_string(),
-                        position,
+                        engine: engine.name.clone(),
+                        position: (results.len() + 1) as u32,
                     });
                 }
             }
-            engines.push(EngineStatus {
-                name: engine.name.to_string(),
-                state: answer.state,
-                daily_count: slot
-                    .limits
-                    .lock()
-                    .expect("engine limits")
-                    .daily_count(Instant::now()),
-                daily_limit: DAILY_LIMIT,
-                error: answer.error,
-                ready_at: ready_at.map(format_deadline),
-            });
         }
         SearchResponse {
             query: query.to_string(),
@@ -291,14 +310,14 @@ mod tests {
             .unwrap()
     }
 
-    fn test_searcher(client: wreq::Client, engines: Vec<&'static Engine>) -> Searcher {
-        Searcher::with_client(
+    fn test_searcher(client: wreq::Client, engines: Vec<&'static Engine>) -> Arc<Searcher> {
+        Arc::new(Searcher::with_client(
             &Config {
                 engines,
                 ..Config::default()
             },
             client,
-        )
+        ))
     }
 
     async fn serve(app: axum::Router) -> &'static str {
@@ -353,10 +372,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_enabled_engines_report_a_state_in_config_order() {
+    async fn engines_run_concurrently_and_report_in_config_order() {
+        let arrived = Arc::new(tokio::sync::Barrier::new(2));
+        let release_first = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new()
-            .route("/first", axum::routing::get(|| async { "first" }))
-            .route("/second", axum::routing::get(|| async { "second" }));
+            .route(
+                "/first",
+                axum::routing::get({
+                    let arrived = arrived.clone();
+                    let release_first = release_first.clone();
+                    move || async move {
+                        arrived.wait().await;
+                        release_first.notified().await;
+                        "first"
+                    }
+                }),
+            )
+            .route(
+                "/second",
+                axum::routing::get(move || async move {
+                    arrived.wait().await;
+                    "second"
+                }),
+            );
         let base = serve(app).await;
         let engines = vec![
             leaked(Engine {
@@ -375,7 +413,16 @@ mod tests {
             }),
         ];
         let searcher = test_searcher(test_client(), engines);
-        let response = searcher.search("rust async runtime").await;
+        let (response, ()) = tokio::join!(searcher.search("rust async runtime"), async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while searcher.status().engines[1].last_state != Some(EngineState::Ok) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the second engine must finish while the first is waiting");
+            release_first.notify_one();
+        });
         assert_eq!(response.query, "rust async runtime");
         assert_eq!(response.engines.len(), 2);
         assert_eq!(response.engines[0].name, "first");
@@ -389,6 +436,70 @@ mod tests {
         assert_eq!(response.results[1].position, 2);
         assert_eq!(response.results[1].engine, "second");
         assert_eq!(response.results[1].title, "second");
+    }
+
+    #[tokio::test]
+    async fn results_merge_by_rank_with_exact_url_deduplication() {
+        let app = axum::Router::new()
+            .route(
+                "/search",
+                axum::routing::get(|| async {
+                    r#"<ol id="b_results">
+                    <li class="b_algo"><h2><a href="https://one.example/">Bing original</a></h2></li>
+                    <li class="b_algo"><h2><a href="https://two.example/">Bing second</a></h2></li>
+                    </ol>"#
+                }),
+            )
+            .route(
+                "/html/",
+                axum::routing::get(|| async {
+                    r#"<div class="result"><a class="result__a" href="https://three.example/">DuckDuckGo first</a></div>
+                    <div class="result"><a class="result__a" href="https://one.example/">Duplicate</a></div>
+                    <div class="result"><a class="result__a" href="https://one.example/?lang=en">Distinct URL</a></div>"#
+                }),
+            );
+        let base = Url::parse(serve(app).await).unwrap();
+        let searcher = Arc::new(
+            Searcher::new(&Config {
+                engines: vec![&bing::ENGINE, &duckduckgo::ENGINE],
+                base_urls: [("bing", base.clone()), ("duckduckgo", base)].into(),
+                ..Config::default()
+            })
+            .unwrap(),
+        );
+        let response = searcher.search("x").await;
+
+        let results: Vec<_> = response
+            .results
+            .iter()
+            .map(|hit| {
+                (
+                    hit.position,
+                    hit.engine.as_str(),
+                    hit.url.as_str(),
+                    hit.title.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                (1, "bing", "https://one.example/", "Bing original"),
+                (
+                    2,
+                    "duckduckgo",
+                    "https://three.example/",
+                    "DuckDuckGo first"
+                ),
+                (3, "bing", "https://two.example/", "Bing second"),
+                (
+                    4,
+                    "duckduckgo",
+                    "https://one.example/?lang=en",
+                    "Distinct URL"
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

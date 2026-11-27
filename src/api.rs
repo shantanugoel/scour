@@ -163,14 +163,12 @@ async fn get_status(State(searcher): State<Arc<Searcher>>) -> Json<StatusRespons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::poll_fn;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::Poll;
     use std::time::Duration;
 
     use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{advance, pause, resume};
+    use tokio::time::{advance, pause, resume, sleep, timeout};
 
     use crate::config::Config;
     use crate::engines::{Engine, Hit, Page};
@@ -288,6 +286,23 @@ mod tests {
         serde_json::from_str(&body).unwrap()
     }
 
+    async fn reserve_next_pace_slot(
+        searcher: &Arc<Searcher>,
+    ) -> tokio::task::JoinHandle<SearchResponse> {
+        let waiting = tokio::spawn({
+            let searcher = searcher.clone();
+            async move { searcher.search("wait").await }
+        });
+        timeout(Duration::from_secs(2), async {
+            while searcher.status().engines[0].daily_count != 6 {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the search should reserve the next pace slot");
+        waiting
+    }
+
     #[tokio::test]
     async fn configured_engine_skips_requests_until_its_block_rest_expires() {
         let requests = Arc::new(AtomicUsize::new(0));
@@ -391,12 +406,7 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 5);
 
-        let mut waiting = std::pin::pin!(searcher.search("wait"));
-        poll_fn(|cx| {
-            assert!(waiting.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
+        let waiting = reserve_next_pace_slot(&searcher).await;
 
         let health = &status_json(address).await["engines"][0];
         assert_eq!(health["last_state"], "ok");
@@ -439,7 +449,7 @@ mod tests {
         let health = &status_json(address).await["engines"][0];
         assert_eq!(health["last_state"], "limited");
         assert!(health.get("ready_at").is_none());
-        let sent = waiting.await;
+        let sent = waiting.await.unwrap();
         assert_eq!(sent.engines[0].state, EngineState::Ok);
         assert_eq!(sent.engines[0].daily_count, 6);
         assert_eq!(requests.load(Ordering::SeqCst), 6);
@@ -480,12 +490,7 @@ mod tests {
         for _ in 0..4 {
             searcher.search("burst").await;
         }
-        let mut waiting = std::pin::pin!(searcher.search("wait"));
-        poll_fn(|cx| {
-            assert!(waiting.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
+        let waiting = reserve_next_pace_slot(&searcher).await;
         assert_eq!(searcher.status().engines[0].daily_count, 6);
         release.notify_one();
         let blocking = blocking.await.unwrap();
@@ -494,7 +499,7 @@ mod tests {
         pause();
         advance(Duration::from_secs(30)).await;
         resume();
-        let refunded = waiting.await;
+        let refunded = waiting.await.unwrap();
         assert_eq!(refunded.engines[0].state, EngineState::Blocked);
         assert_eq!(refunded.engines[0].ready_at, blocking.engines[0].ready_at);
         assert_eq!(refunded.engines[0].daily_count, 5);

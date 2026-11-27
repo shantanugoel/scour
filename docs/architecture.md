@@ -31,7 +31,8 @@ flowchart LR
 | Daemon | Serves the JSON API and MCP on `127.0.0.1:7268` only. One layer rejects every request with a foreign `Host` or `Origin`. | `tokio`, `axum` | built |
 | MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The tool description warns that titles and snippets are untrusted web text. A per-query `engines` argument and the open challenges are planned. | `rmcp` (streamable HTTP, stateless JSON) | built |
 | JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. | `axum`, `wreq` | built |
-| Cascade | Selects the engines for a query and skips each engine that rests or is at its limit. It sends each HTTP engine through the HTTP tier, and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. It merges the results and removes duplicate URLs. | Rust | planned |
+| Parallel HTTP search | Starts one task per enabled engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
+| Cascade | Selects the engines for a query. It sends each HTTP engine through the HTTP tier and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. | Rust | planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
@@ -44,6 +45,9 @@ flowchart LR
 
 - **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
   `content`, `engine` and `position`, and `engines[]` with `name`, `state`, `daily_count` and `daily_limit`.
+  The merge takes one item per engine in config order for each rank. It keeps the first occurrence of each exact
+  URL string, including that item's engine, and assigns consecutive positions starting at 1.
+  The `engines[]` array stays in config order even when engine tasks finish out of order.
   `engines[].error` is present only when the state is `error`. `engines[].ready_at` is present for `blocked`
   and `limited`. It is an RFC 3339 UTC
   timestamp to the second. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
@@ -55,8 +59,8 @@ flowchart LR
   non-200 response gives `error` with `HTTP <n>`. Network failures and timeouts also give `error`.
   On HTTP 200, parsed results give `ok`. A DuckDuckGo no-results marker gives `empty`. Unrecognized
   DuckDuckGo pages give `parse_failed`. Bing reports `empty` when its parser finds no results on HTTP 200.
-  The CLI prints `blocked`, `limited`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns
-  `ok` or `empty`.
+  The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed`
+  and `error` to stderr. If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with code 1.
 - **Rest.** The first block starts a 10-minute rest by default. Each consecutive block doubles that duration, up to 4 hours.
   An `ok` response clears rest and resets the count. An `empty`, `parse_failed` or `error` response leaves both unchanged.
   A monotonic clock controls when the next request can go out. The daemon stores a wall-clock deadline for each rest window.
