@@ -30,6 +30,8 @@ enum Command {
     },
     /// Ask the local daemon to search.
     Search { query: String },
+    /// Show engine health and daily counts.
+    Status,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -37,6 +39,7 @@ async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve { config } => serve(config).await,
         Command::Search { query } => cli::search(&query).await,
+        Command::Status => cli::status().await,
     }
 }
 

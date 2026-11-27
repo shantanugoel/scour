@@ -2,44 +2,24 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use url::Url;
 
-use crate::api::{ADDR, EngineState, SearchResponse};
+use crate::api::{ADDR, EngineState, SearchResponse, StatusResponse};
 
-/// Two engines can each take the 10 s search timeout, so wait longer than 20 s.
-const DAEMON_WAIT: Duration = Duration::from_secs(25);
+const DAEMON_WAIT: Duration = Duration::from_secs(45);
 
 pub async fn search(query: &str) -> ExitCode {
-    let endpoint = format!("http://{ADDR}/search");
-    let response = match request_daemon(&endpoint, query).await {
+    let mut url = Url::parse(&format!("http://{ADDR}/search")).expect("daemon URL");
+    url.query_pairs_mut().append_pair("q", query);
+    let response: SearchResponse = match request_daemon(&url, "search").await {
         Ok(response) => response,
         Err(line) => {
             eprintln!("{line}");
             return ExitCode::from(1);
         }
     };
-    let status = response.status().as_u16();
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(err) => {
-            eprintln!("{}", body_read_failure_message(&err));
-            return ExitCode::from(1);
-        }
-    };
-    if status != 200 {
-        let message = serde_json::from_str::<ApiError>(&body)
-            .map(|error| error.error)
-            .unwrap_or_else(|_| "the search failed".to_string());
-        eprintln!("scour: {message}");
-        return ExitCode::from(1);
-    }
-    let parsed = match serde_json::from_str::<SearchResponse>(&body) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            eprintln!("scour: the search failed");
-            return ExitCode::from(1);
-        }
-    };
-    let presented = present(&parsed, Utc::now());
+    let presented = present(&response, Utc::now());
     if !presented.stdout.is_empty() {
         print!("{}", presented.stdout);
     }
@@ -51,6 +31,27 @@ pub async fn search(query: &str) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+pub async fn status() -> ExitCode {
+    let url = Url::parse(&format!("http://{ADDR}/status")).expect("daemon URL");
+    let response: StatusResponse = match request_daemon(&url, "status request").await {
+        Ok(response) => response,
+        Err(line) => {
+            eprintln!("{line}");
+            return ExitCode::from(1);
+        }
+    };
+    let now = Utc::now();
+    for engine in &response.engines {
+        let state = engine.last_state.map_or("idle", state_name);
+        let ready = deadline_text(engine.ready_at.as_deref(), now);
+        println!(
+            "{}: {state} ({}/{} daily){ready}",
+            engine.name, engine.daily_count, engine.daily_limit
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// The whole answer as one text, for a caller that has no separate error stream, such as MCP.
@@ -82,33 +83,36 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
         stdout.push('\n');
     }
     for engine in &response.engines {
-        let count = response
-            .results
-            .iter()
-            .filter(|result| result.engine == engine.name)
-            .count();
+        let state = state_name(engine.state);
+        let daily = format!("{}/{} daily", engine.daily_count, engine.daily_limit);
         match engine.state {
-            EngineState::Ok => {
-                stdout.push_str(&format!("{}: ok ({count} results)\n", engine.name));
+            EngineState::Ok | EngineState::Empty => {
+                let count = response
+                    .results
+                    .iter()
+                    .filter(|result| result.engine == engine.name)
+                    .count();
+                stdout.push_str(&format!(
+                    "{}: {state} ({count} results) ({daily})\n",
+                    engine.name
+                ));
             }
-            EngineState::Empty => {
-                stdout.push_str(&format!("{}: empty ({count} results)\n", engine.name));
-            }
-            EngineState::Blocked => {
-                let rest = engine
-                    .ready_at
-                    .as_deref()
-                    .map_or_else(String::new, |ready_at| {
-                        format!(" until {ready_at}{}", remaining_time(ready_at, now))
-                    });
-                stderr.push_str(&format!("scour: {}: blocked{rest}\n", engine.name));
+            EngineState::Blocked | EngineState::Limited => {
+                let ready = deadline_text(engine.ready_at.as_deref(), now);
+                stderr.push_str(&format!(
+                    "scour: {}: {state} ({daily}){ready}\n",
+                    engine.name
+                ));
             }
             EngineState::ParseFailed => {
-                stderr.push_str(&format!("scour: {}: parse_failed\n", engine.name));
+                stderr.push_str(&format!("scour: {}: {state} ({daily})\n", engine.name));
             }
             EngineState::Error => {
                 let message = engine.error.as_deref().unwrap_or("error");
-                stderr.push_str(&format!("scour: {}: error: {message}\n", engine.name));
+                stderr.push_str(&format!(
+                    "scour: {}: {state}: {message} ({daily})\n",
+                    engine.name
+                ));
             }
         }
     }
@@ -120,6 +124,23 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
         stderr,
         success,
     }
+}
+
+fn state_name(state: EngineState) -> &'static str {
+    match state {
+        EngineState::Ok => "ok",
+        EngineState::Empty => "empty",
+        EngineState::Blocked => "blocked",
+        EngineState::Limited => "limited",
+        EngineState::ParseFailed => "parse_failed",
+        EngineState::Error => "error",
+    }
+}
+
+fn deadline_text(ready_at: Option<&str>, now: DateTime<Utc>) -> String {
+    ready_at.map_or_else(String::new, |ready_at| {
+        format!(" until {ready_at}{}", remaining_time(ready_at, now))
+    })
 }
 
 fn remaining_time(ready_at: &str, now: DateTime<Utc>) -> String {
@@ -140,17 +161,30 @@ struct ApiError {
     error: String,
 }
 
-async fn request_daemon(endpoint: &str, query: &str) -> Result<wreq::Response, String> {
+async fn request_daemon<T: DeserializeOwned>(url: &Url, action: &str) -> Result<T, String> {
     let client = crate::search::http_client()
         .map_err(|err| format!("scour: cannot start the client: {err}"))?;
-    let mut url = url::Url::parse(endpoint).expect("daemon url");
-    url.query_pairs_mut().append_pair("q", query);
-    client
+    let fallback = || format!("scour: the {action} failed");
+    let response = client
         .get(url.as_str())
         .timeout(DAEMON_WAIT)
         .send()
         .await
-        .map_err(|err| connect_failure_message(&err))
+        .map_err(|err| connect_failure_message(&err))?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|err| {
+        if err.is_timeout() {
+            timeout_message()
+        } else {
+            fallback()
+        }
+    })?;
+    if status != 200 {
+        return Err(serde_json::from_str::<ApiError>(&body)
+            .map(|error| format!("scour: {}", error.error))
+            .unwrap_or_else(|_| fallback()));
+    }
+    serde_json::from_str(&body).map_err(|_| fallback())
 }
 
 fn connect_failure_message(err: &wreq::Error) -> String {
@@ -159,14 +193,6 @@ fn connect_failure_message(err: &wreq::Error) -> String {
         timeout_message()
     } else {
         format!("scour: no daemon on {ADDR}. Start it with: scour serve")
-    }
-}
-
-fn body_read_failure_message(err: &wreq::Error) -> String {
-    if err.is_timeout() {
-        timeout_message()
-    } else {
-        "scour: the search failed".to_string()
     }
 }
 
@@ -197,6 +223,8 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Ok,
                 error: None,
+                daily_count: 1,
+                daily_limit: 200,
                 ready_at: None,
             }],
         };
@@ -205,7 +233,7 @@ mod tests {
         assert!(presented.stderr.is_empty());
         assert_eq!(
             presented.stdout,
-            "1. Tokio\nhttps://tokio.rs/\nAn asynchronous runtime\n\nbing: ok (1 results)\n"
+            "1. Tokio\nhttps://tokio.rs/\nAn asynchronous runtime\n\nbing: ok (1 results) (1/200 daily)\n"
         );
     }
 
@@ -218,6 +246,8 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Error,
                 error: Some("cannot connect to www.bing.com".to_string()),
+                daily_count: 1,
+                daily_limit: 200,
                 ready_at: None,
             }],
         };
@@ -226,7 +256,7 @@ mod tests {
         assert!(presented.stdout.is_empty());
         assert_eq!(
             presented.stderr,
-            "scour: bing: error: cannot connect to www.bing.com\n"
+            "scour: bing: error: cannot connect to www.bing.com (1/200 daily)\n"
         );
         assert!(!presented.stderr.contains("ok"));
         assert!(!presented.stderr.contains("empty"));
@@ -245,6 +275,8 @@ mod tests {
                     name: "duckduckgo".to_string(),
                     state,
                     error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
                     ready_at: None,
                 }],
             };
@@ -274,6 +306,8 @@ mod tests {
                 name: "duckduckgo".to_string(),
                 state: EngineState::Blocked,
                 error: None,
+                daily_count: 1,
+                daily_limit: 200,
                 ready_at: Some(ready_at.to_string()),
             }],
         };
@@ -289,7 +323,9 @@ mod tests {
             let presented = present(&response, now);
             assert_eq!(
                 presented.stderr,
-                format!("scour: duckduckgo: blocked until {ready_at} (in {countdown})\n"),
+                format!(
+                    "scour: duckduckgo: blocked (1/200 daily) until {ready_at} (in {countdown})\n"
+                ),
                 "{milliseconds} ms remaining"
             );
         }
@@ -304,13 +340,15 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Empty,
                 error: None,
+                daily_count: 1,
+                daily_limit: 200,
                 ready_at: None,
             }],
         };
         let presented = present(&response, Utc::now());
         assert!(presented.success);
         assert!(presented.stderr.is_empty());
-        assert_eq!(presented.stdout, "bing: empty (0 results)\n");
+        assert_eq!(presented.stdout, "bing: empty (0 results) (1/200 daily)\n");
     }
 
     #[test]
@@ -338,20 +376,32 @@ mod tests {
                     name: "duckduckgo".to_string(),
                     state: EngineState::Ok,
                     error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
                     ready_at: None,
                 },
                 EngineStatus {
                     name: "bing".to_string(),
                     state: EngineState::Ok,
                     error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
                     ready_at: None,
                 },
             ],
         };
         let presented = present(&response, Utc::now());
         assert!(presented.success);
-        assert!(presented.stdout.contains("duckduckgo: ok (1 results)\n"));
-        assert!(presented.stdout.contains("bing: ok (1 results)\n"));
+        assert!(
+            presented
+                .stdout
+                .contains("duckduckgo: ok (1 results) (1/200 daily)\n")
+        );
+        assert!(
+            presented
+                .stdout
+                .contains("bing: ok (1 results) (1/200 daily)\n")
+        );
         assert!(presented.stderr.is_empty());
     }
 
@@ -363,8 +413,8 @@ mod tests {
         let address = listener.local_addr().expect("addr");
         drop(listener);
         assert_ne!(address.port(), ADDR.port());
-        let endpoint = format!("http://{address}/search");
-        let err = request_daemon(&endpoint, "x")
+        let endpoint = Url::parse(&format!("http://{address}/search?q=x")).unwrap();
+        let err = request_daemon::<SearchResponse>(&endpoint, "search")
             .await
             .expect_err("closed port");
         assert_eq!(

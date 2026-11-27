@@ -43,6 +43,7 @@ pub enum EngineState {
     Ok,
     Empty,
     Blocked,
+    Limited,
     ParseFailed,
     Error,
 }
@@ -51,8 +52,25 @@ pub enum EngineState {
 pub struct EngineStatus {
     pub name: String,
     pub state: EngineState,
+    pub daily_count: u32,
+    pub daily_limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub engines: Vec<EngineHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineHealth {
+    pub name: String,
+    pub last_state: Option<EngineState>,
+    pub daily_count: u32,
+    pub daily_limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<String>,
 }
@@ -70,6 +88,7 @@ struct ErrorBody {
 pub fn router(searcher: Arc<Searcher>) -> axum::Router {
     axum::Router::new()
         .route("/search", axum::routing::get(get_search))
+        .route("/status", axum::routing::get(get_status))
         .route_service("/mcp", crate::mcp::service(searcher.clone()))
         .with_state(searcher)
         .layer(axum::middleware::from_fn(guard_local))
@@ -137,10 +156,16 @@ async fn get_search(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+async fn get_status(State(searcher): State<Arc<Searcher>>) -> Json<StatusResponse> {
+    Json(searcher.status())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::poll_fn;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
     use std::time::Duration;
 
     use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
@@ -257,6 +282,12 @@ mod tests {
         serde_json::from_str(&text).expect("search answer")
     }
 
+    async fn status_json(address: SocketAddr) -> serde_json::Value {
+        let (status, body) = raw(address, &get("/status", &["localhost"], &[])).await;
+        assert_eq!(status, 200);
+        serde_json::from_str(&body).unwrap()
+    }
+
     #[tokio::test]
     async fn configured_engine_skips_requests_until_its_block_rest_expires() {
         let requests = Arc::new(AtomicUsize::new(0));
@@ -284,12 +315,22 @@ mod tests {
         let config = crate::config::load(Some(&path));
         std::fs::remove_file(path).unwrap();
         let searcher = Searcher::new(&config.unwrap()).unwrap();
-        let (base, _) = serve(router(Arc::new(searcher))).await;
+        let (base, address) = serve(router(Arc::new(searcher))).await;
+
+        assert_eq!(
+            status_json(address).await,
+            serde_json::json!({"engines": [{
+                "name": "duckduckgo", "last_state": null, "daily_count": 0, "daily_limit": 200
+            }]})
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         let before = Utc::now();
         let blocked = search_json(base, "rust async runtime").await;
         let after = Utc::now();
         assert_eq!(blocked.engines[0].state, EngineState::Blocked);
+        assert_eq!(blocked.engines[0].daily_count, 1);
+        assert_eq!(blocked.engines[0].daily_limit, 200);
         let ready_at = blocked.engines[0].ready_at.as_deref().unwrap();
         let deadline = DateTime::parse_from_rfc3339(ready_at).unwrap().to_utc();
         assert_eq!(
@@ -309,15 +350,155 @@ mod tests {
         resume();
         let resting = search_json(base, "second query").await;
         assert_eq!(resting.engines, blocked.engines);
+        assert_eq!(
+            status_json(address).await["engines"][0],
+            serde_json::json!({
+                "name": "duckduckgo", "last_state": "blocked", "ready_at": ready_at,
+                "daily_count": 1, "daily_limit": 200
+            })
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
         pause();
         advance(Duration::from_secs(15)).await;
         resume();
+        let health = &status_json(address).await["engines"][0];
+        assert_eq!(health["last_state"], "blocked");
+        assert!(health.get("ready_at").is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
         let resumed = search_json(base, "rust async runtime").await;
         assert_eq!(resumed.engines[0].state, EngineState::Ok);
         assert!(resumed.engines[0].ready_at.is_none());
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_reports_limited_while_the_next_pace_slot_is_reserved() {
+        let (engine_base, requests) = engine(StatusCode::OK, "Tokio").await;
+        let searcher = searcher(engine_base);
+        let (base, address) = serve(router(searcher.clone())).await;
+        for count in 1..=5 {
+            let response = search_json(base, "burst").await;
+            assert_eq!(response.engines[0].state, EngineState::Ok);
+            assert_eq!(response.engines[0].daily_count, count);
+            assert_eq!(requests.load(Ordering::SeqCst), count as usize);
+        }
+        assert!(
+            status_json(address).await["engines"][0]
+                .get("ready_at")
+                .is_none()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+
+        let mut waiting = std::pin::pin!(searcher.search("wait"));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let health = &status_json(address).await["engines"][0];
+        assert_eq!(health["last_state"], "ok");
+        assert!(health["ready_at"].is_string());
+        assert_eq!(health["daily_count"], 6);
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+
+        let (status, called) = rpc(
+            base,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "search", "arguments": {"query": "too soon"}}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let result = &called["result"];
+        assert_eq!(result["isError"], true);
+        let engine = &result["structuredContent"]["engines"][0];
+        assert_eq!(engine["state"], "limited");
+        assert_eq!(engine["daily_count"], 6);
+        assert_eq!(engine["daily_limit"], 200);
+        let ready_at = engine["ready_at"].as_str().unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(&format!("limited (6/200 daily) until {ready_at} (in ")),
+            "{text}"
+        );
+        assert_eq!(
+            status_json(address).await["engines"][0]["last_state"],
+            "limited"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+
+        pause();
+        advance(Duration::from_secs(30)).await;
+        resume();
+        let health = &status_json(address).await["engines"][0];
+        assert_eq!(health["last_state"], "limited");
+        assert!(health.get("ready_at").is_none());
+        let sent = waiting.await;
+        assert_eq!(sent.engines[0].state, EngineState::Ok);
+        assert_eq!(sent.engines[0].daily_count, 6);
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn a_block_during_pace_sleep_refunds_the_waiting_search() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            "/engine",
+            axum::routing::get({
+                let (requests, entered, release) =
+                    (requests.clone(), entered.clone(), release.clone());
+                move || {
+                    let index = requests.fetch_add(1, Ordering::SeqCst);
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        if index == 0 {
+                            entered.notify_one();
+                            release.notified().await;
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }
+            }),
+        );
+        let (engine_base, _) = serve(app).await;
+        let searcher = searcher(engine_base);
+        let blocking = tokio::spawn({
+            let searcher = searcher.clone();
+            async move { searcher.search("block").await }
+        });
+        entered.notified().await;
+        for _ in 0..4 {
+            searcher.search("burst").await;
+        }
+        let mut waiting = std::pin::pin!(searcher.search("wait"));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(searcher.status().engines[0].daily_count, 6);
+        release.notify_one();
+        let blocking = blocking.await.unwrap();
+        assert_eq!(blocking.engines[0].state, EngineState::Blocked);
+
+        pause();
+        advance(Duration::from_secs(30)).await;
+        resume();
+        let refunded = waiting.await;
+        assert_eq!(refunded.engines[0].state, EngineState::Blocked);
+        assert_eq!(refunded.engines[0].ready_at, blocking.engines[0].ready_at);
+        assert_eq!(refunded.engines[0].daily_count, 5);
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
@@ -365,7 +546,8 @@ mod tests {
         let description = tools[0]["description"].as_str().expect("description");
         assert!(description.contains("untrusted"));
 
-        let reference = search_json(base, "rust async runtime").await;
+        let mut reference = search_json(base, "rust async runtime").await;
+        assert_eq!(reference.engines[0].daily_count, 1);
 
         let (status, called) = rpc(
             base,
@@ -380,6 +562,7 @@ mod tests {
         assert_eq!(status, 200);
         let result = &called["result"];
         assert_eq!(result["isError"], false);
+        reference.engines[0].daily_count = 2;
         assert_eq!(
             result["structuredContent"],
             serde_json::to_value(&reference).unwrap()
@@ -478,6 +661,8 @@ mod tests {
             let text = result["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(expected_text), "{text}");
             let engine = &result["structuredContent"]["engines"][0];
+            assert_eq!(engine["daily_count"], 1);
+            assert_eq!(engine["daily_limit"], 200);
             if state == "blocked" {
                 let ready_at = engine["ready_at"].as_str().expect("a rest deadline");
                 assert!(text.contains(&format!("{ready_at} (in 10 min)")), "{text}");
@@ -542,7 +727,7 @@ mod tests {
             (&[local], &[origin, origin]),
         ];
 
-        for path in ["/search?q=x", "/mcp", "/no-route"] {
+        for path in ["/search?q=x", "/status", "/mcp", "/no-route"] {
             for &(hosts, origins) in cases {
                 let (status, body) = raw(address, &get(path, hosts, origins)).await;
                 assert_eq!(

@@ -43,16 +43,36 @@ The CLI, JSON API and MCP report a state for each engine.
 | `ok` | The engine returned results. |
 | `empty` | DuckDuckGo showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
 | `blocked` | The engine is resting, returned HTTP 403 or 429, or DuckDuckGo showed a challenge page. |
+| `limited` | The engine reached its daily limit, or its next pace slot is more than 30 seconds away. |
 | `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. |
 | `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
 
-The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns `ok` or `empty`.
+The CLI prints `blocked`, `limited`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns `ok` or `empty`.
+Each engine summary includes the daily count and limit, for example `1/200 daily`.
 
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
 An `ok` response resets the backoff. An `empty`, `parse_failed` or `error` response leaves it unchanged.
 The blocking search and searches during the same rest window report the same `ready_at` in RFC 3339 UTC.
+Each engine starts with five pace tokens and gains one every 30 seconds, up to five.
+A search can wait up to 30 seconds for a token. It checks for rest again before it sends the request.
+Each engine allows 200 requests in a rolling 24-hour window. Failed requests count toward this limit.
+While the engine rests or the search is limited, the daemon skips the request and adds nothing to the count.
+The daemon keeps these counts in memory and resets them on restart.
+
+Both `blocked` and `limited` search responses give a `ready_at` time.
 The CLI and MCP text show the timestamp and the remaining time rounded up to seconds.
 If the rounded time is 60 seconds or more, they show it in minutes rounded up.
+
+3. Check engine status without sending a search.
+
+```sh
+./target/release/scour status
+```
+
+`GET /status` returns each engine's name, last state, daily count and daily limit.
+Before the first search, the CLI shows `idle` and the JSON field `last_state` is `null`.
+Status shows `ready_at` for active rest, a full daily window, or a pace wait longer than 30 seconds.
+When a deadline appears, `scour status` also prints the remaining time.
 
 ## Use MCP
 
