@@ -36,7 +36,9 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the
 result site. The last line names the engine `duckduckgo` and the state `ok`.
 
-The CLI, JSON API and MCP report a state for each engine.
+When several engines are enabled, the daemon queries them in parallel. It reports their states in config order.
+The daemon takes one result from each engine in config order, then repeats for each rank.
+It keeps the first occurrence of each exact URL and numbers the merged results from 1.
 
 | State | Meaning |
 | --- | --- |
@@ -47,7 +49,8 @@ The CLI, JSON API and MCP report a state for each engine.
 | `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. |
 | `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
 
-The CLI prints `blocked`, `limited`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns `ok` or `empty`.
+The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed` and `error` to stderr.
+If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with code 1.
 Each engine summary includes the daily count and limit, for example `1/200 daily`.
 
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.

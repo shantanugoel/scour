@@ -51,17 +51,16 @@ impl Limits {
             return Admit::Limited(ready_at);
         }
         let backlog = self.pace_backlog(now);
-        let wait = backlog.saturating_sub(BURST_CREDIT);
-        if wait > PACE_INTERVAL {
+        if let Some(ready_at) = self.pace_deadline(backlog) {
             self.last_state = Some(EngineState::Limited);
-            return Admit::Limited(wall + time_delta(wait));
+            return Admit::Limited(ready_at);
         }
 
         // Represent the bucket as refill time owed. Burst credit lets requests consume it early.
         let next = backlog + PACE_INTERVAL;
         self.pace_cursor = Some((now + next, wall + time_delta(next)));
         self.daily.push_back((now, wall));
-        Admit::SendAt(now + wait)
+        Admit::SendAt(now + backlog.saturating_sub(BURST_CREDIT))
     }
 
     pub fn confirm_send(
@@ -81,11 +80,7 @@ impl Limits {
     pub fn peek(&self, now: Instant) -> Option<DateTime<Utc>> {
         self.active_rest(now)
             .or_else(|| self.daily_deadline(now))
-            .or_else(|| {
-                let (_, wall) = self.pace_cursor?;
-                (self.pace_backlog(now).saturating_sub(BURST_CREDIT) > PACE_INTERVAL)
-                    .then(|| wall - time_delta(BURST_CREDIT))
-            })
+            .or_else(|| self.pace_deadline(self.pace_backlog(now)))
     }
 
     pub fn daily_count(&self, now: Instant) -> u32 {
@@ -118,6 +113,11 @@ impl Limits {
     fn pace_backlog(&self, now: Instant) -> Duration {
         self.pace_cursor
             .map_or(Duration::ZERO, |(at, _)| at.saturating_duration_since(now))
+    }
+
+    fn pace_deadline(&self, backlog: Duration) -> Option<DateTime<Utc>> {
+        let (_, wall) = self.pace_cursor?;
+        (backlog > BURST_CREDIT + PACE_INTERVAL).then(|| wall - time_delta(BURST_CREDIT))
     }
 
     pub fn record(
@@ -163,7 +163,7 @@ mod tests {
         pause();
         let mut limits = Limits::new(Duration::from_secs(600));
         let now = Instant::now();
-        let wall = Utc::now();
+        let wall = DateTime::from_timestamp(1_800_000_000, 999_500_000).unwrap();
         for _ in 0..5 {
             assert!(matches!(limits.admit(now, wall), Admit::SendAt(at) if at == now));
         }
@@ -175,7 +175,12 @@ mod tests {
         let ready_at = wall + TimeDelta::seconds(60);
         assert_eq!(limits.peek(now), Some(ready_at));
         assert!(matches!(limits.admit(now, wall), Admit::Limited(at) if at == ready_at));
-        assert_eq!(limits.daily_count(now), 6);
+        // A small change in the offset between clock samples can cross a wall-clock second.
+        let later = now + Duration::from_millis(1);
+        let later_wall = wall + TimeDelta::milliseconds(2);
+        assert_eq!(limits.peek(later), Some(ready_at));
+        assert!(matches!(limits.admit(later, later_wall), Admit::Limited(at) if at == ready_at));
+        assert_eq!(limits.daily_count(later), 6);
 
         advance(Duration::from_secs(30)).await;
         assert_eq!(limits.peek(Instant::now()), None);
