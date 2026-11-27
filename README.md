@@ -137,7 +137,6 @@ scripts/check
 ```
 
 The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests use saved pages and loopback servers.
-The CLI tests start a daemon on `127.0.0.1:7268`. Keep that port free in the test environment.
 
 ## Size and memory
 

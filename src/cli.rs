@@ -26,11 +26,7 @@ pub async fn search(query: &str) -> ExitCode {
     if !presented.stderr.is_empty() {
         eprint!("{}", presented.stderr);
     }
-    if presented.success {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    }
+    presented.exit_code
 }
 
 pub async fn status() -> ExitCode {
@@ -63,7 +59,7 @@ pub fn render(response: &SearchResponse) -> String {
 struct Presented {
     stdout: String,
     stderr: String,
-    success: bool,
+    exit_code: ExitCode,
 }
 
 fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
@@ -122,7 +118,11 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
     Presented {
         stdout,
         stderr,
-        success,
+        exit_code: if success {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        },
     }
 }
 
@@ -209,7 +209,7 @@ mod tests {
     use crate::api::{EngineStatus, ResultItem};
 
     #[test]
-    fn ok_search_prints_results_and_names_bing() {
+    fn partial_failure_prints_results_and_summary_to_stdout_and_block_to_stderr() {
         let response = SearchResponse {
             query: "rust async runtime".to_string(),
             results: vec![ResultItem {
@@ -219,21 +219,72 @@ mod tests {
                 engine: "bing".to_string(),
                 position: 1,
             }],
-            engines: vec![EngineStatus {
-                name: "bing".to_string(),
-                state: EngineState::Ok,
-                error: None,
-                daily_count: 1,
-                daily_limit: 200,
-                ready_at: None,
-            }],
+            engines: vec![
+                EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state: EngineState::Blocked,
+                    error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
+                    ready_at: Some("2026-01-01T00:10:00Z".to_string()),
+                },
+                EngineStatus {
+                    name: "bing".to_string(),
+                    state: EngineState::Ok,
+                    error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
+                    ready_at: None,
+                },
+            ],
         };
-        let presented = present(&response, Utc::now());
-        assert!(presented.success);
-        assert!(presented.stderr.is_empty());
+        let now = "2026-01-01T00:00:00Z".parse().unwrap();
+        let presented = present(&response, now);
+        assert_eq!(presented.exit_code, ExitCode::SUCCESS);
         assert_eq!(
             presented.stdout,
             "1. Tokio\nhttps://tokio.rs/\nAn asynchronous runtime\n\nbing: ok (1 results) (1/200 daily)\n"
+        );
+        assert_eq!(
+            presented.stderr,
+            "scour: duckduckgo: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n"
+        );
+    }
+
+    #[test]
+    fn all_resting_engines_print_only_stderr_and_exit_one() {
+        let response = SearchResponse {
+            query: "rust async runtime".to_string(),
+            results: Vec::new(),
+            engines: vec![
+                EngineStatus {
+                    name: "duckduckgo".to_string(),
+                    state: EngineState::Blocked,
+                    error: None,
+                    daily_count: 1,
+                    daily_limit: 200,
+                    ready_at: Some("2026-01-01T00:10:00Z".to_string()),
+                },
+                EngineStatus {
+                    name: "bing".to_string(),
+                    state: EngineState::Limited,
+                    error: None,
+                    daily_count: 6,
+                    daily_limit: 200,
+                    ready_at: Some("2026-01-01T00:00:45Z".to_string()),
+                },
+            ],
+        };
+        let now = "2026-01-01T00:00:00Z".parse().unwrap();
+        let presented = present(&response, now);
+        assert_eq!(presented.exit_code, ExitCode::from(1));
+        assert!(presented.stdout.is_empty());
+        assert_eq!(
+            presented.stderr,
+            concat!(
+                "scour: duckduckgo: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n",
+                "scour: bing: limited (6/200 daily) until 2026-01-01T00:00:45Z (in 45 s)\n",
+            )
         );
     }
 
@@ -252,7 +303,7 @@ mod tests {
             }],
         };
         let presented = present(&response, Utc::now());
-        assert!(!presented.success);
+        assert_eq!(presented.exit_code, ExitCode::from(1));
         assert!(presented.stdout.is_empty());
         assert_eq!(
             presented.stderr,
@@ -281,7 +332,7 @@ mod tests {
                 }],
             };
             let presented = present(&response, Utc::now());
-            assert!(!presented.success, "{name}");
+            assert_eq!(presented.exit_code, ExitCode::from(1), "{name}");
             assert!(presented.stdout.is_empty(), "{name}");
             assert!(
                 presented
@@ -346,7 +397,7 @@ mod tests {
             }],
         };
         let presented = present(&response, Utc::now());
-        assert!(presented.success);
+        assert_eq!(presented.exit_code, ExitCode::SUCCESS);
         assert!(presented.stderr.is_empty());
         assert_eq!(presented.stdout, "bing: empty (0 results) (1/200 daily)\n");
     }
@@ -391,7 +442,7 @@ mod tests {
             ],
         };
         let presented = present(&response, Utc::now());
-        assert!(presented.success);
+        assert_eq!(presented.exit_code, ExitCode::SUCCESS);
         assert!(
             presented
                 .stdout

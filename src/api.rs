@@ -171,7 +171,7 @@ mod tests {
     use tokio::time::{advance, pause, resume, sleep, timeout};
 
     use crate::config::Config;
-    use crate::engines::{Engine, Hit, Page};
+    use crate::engines::{Engine, Hit, Page, bing, duckduckgo};
 
     const ACCEPT: &str = "application/json, text/event-stream";
 
@@ -242,6 +242,34 @@ mod tests {
         )
     }
 
+    async fn blocked_duckduckgo_with_bing() -> (Arc<Searcher>, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = axum::Router::new()
+            .route(
+                "/html/",
+                axum::routing::get(|| async { StatusCode::FORBIDDEN }),
+            )
+            .route(
+                "/search",
+                axum::routing::get(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        r#"<ol id="b_results"><li class="b_algo"><h2>
+                        <a href="https://tokio.rs/">Tokio</a></h2></li></ol>"#
+                    }
+                }),
+            );
+        let (base, _) = serve(app).await;
+        let base = url::Url::parse(base).unwrap();
+        let config = Config {
+            engines: vec![&duckduckgo::ENGINE, &bing::ENGINE],
+            base_urls: [("duckduckgo", base.clone()), ("bing", base)].into(),
+            ..Config::default()
+        };
+        (Arc::new(Searcher::new(&config).unwrap()), requests)
+    }
+
     fn client() -> wreq::Client {
         wreq::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -269,15 +297,28 @@ mod tests {
     async fn search_json(base: &str, query: &str) -> SearchResponse {
         let mut url = url::Url::parse(&format!("{base}/search")).unwrap();
         url.query_pairs_mut().append_pair("q", query);
-        let text = client()
+        let response = client()
             .get(url.as_str())
             .send()
             .await
-            .expect("search request")
-            .text()
-            .await
-            .expect("body");
-        serde_json::from_str(&text).expect("search answer")
+            .expect("search request");
+        assert_eq!(response.status().as_u16(), 200);
+        response.json().await.expect("search answer")
+    }
+
+    async fn mcp_search(base: &str, query: &str) -> serde_json::Value {
+        let (status, mut called) = rpc(
+            base,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "search", "arguments": {"query": query}}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        called["result"].take()
     }
 
     async fn status_json(address: SocketAddr) -> serde_json::Value {
@@ -288,13 +329,14 @@ mod tests {
 
     async fn reserve_next_pace_slot(
         searcher: &Arc<Searcher>,
+        engine_index: usize,
     ) -> tokio::task::JoinHandle<SearchResponse> {
         let waiting = tokio::spawn({
             let searcher = searcher.clone();
             async move { searcher.search("wait").await }
         });
         timeout(Duration::from_secs(2), async {
-            while searcher.status().engines[0].daily_count != 6 {
+            while searcher.status().engines[engine_index].daily_count != 6 {
                 sleep(Duration::from_millis(1)).await;
             }
         })
@@ -389,56 +431,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_reports_limited_while_the_next_pace_slot_is_reserved() {
-        let (engine_base, requests) = engine(StatusCode::OK, "Tokio").await;
-        let searcher = searcher(engine_base);
+    async fn a_blocked_engine_leaves_the_other_engines_results_available() {
+        let (searcher, requests) = blocked_duckduckgo_with_bing().await;
+        let (base, _) = serve(router(searcher)).await;
+        let mut response = search_json(base, "rust").await;
+        let [duckduckgo, bing] = response.engines.as_mut_slice() else {
+            panic!("expected two engine states");
+        };
+        assert_eq!(duckduckgo.name, "duckduckgo");
+        assert_eq!(duckduckgo.state, EngineState::Blocked);
+        assert!(duckduckgo.ready_at.is_some());
+        assert_eq!(bing.name, "bing");
+        assert_eq!(bing.state, EngineState::Ok);
+        assert_eq!(bing.daily_count, 1);
+        assert_eq!(
+            response.results,
+            [ResultItem {
+                url: "https://tokio.rs/".to_string(),
+                title: "Tokio".to_string(),
+                content: String::new(),
+                engine: "bing".to_string(),
+                position: 1,
+            }]
+        );
+
+        let mcp = mcp_search(base, "rust").await;
+        assert_eq!(mcp["isError"], false);
+        bing.daily_count = 2;
+        assert_eq!(
+            mcp["structuredContent"],
+            serde_json::to_value(response).unwrap()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn all_resting_engines_report_their_deadlines_and_no_answer() {
+        let (searcher, requests) = blocked_duckduckgo_with_bing().await;
         let (base, address) = serve(router(searcher.clone())).await;
         for count in 1..=5 {
             let response = search_json(base, "burst").await;
-            assert_eq!(response.engines[0].state, EngineState::Ok);
-            assert_eq!(response.engines[0].daily_count, count);
+            assert_eq!(response.engines[1].state, EngineState::Ok);
+            assert_eq!(response.engines[1].daily_count, count);
             assert_eq!(requests.load(Ordering::SeqCst), count as usize);
         }
         assert!(
-            status_json(address).await["engines"][0]
+            status_json(address).await["engines"][1]
                 .get("ready_at")
                 .is_none()
         );
         assert_eq!(requests.load(Ordering::SeqCst), 5);
 
-        let waiting = reserve_next_pace_slot(&searcher).await;
+        let waiting = reserve_next_pace_slot(&searcher, 1).await;
 
-        let health = &status_json(address).await["engines"][0];
-        assert_eq!(health["last_state"], "ok");
-        assert!(health["ready_at"].is_string());
-        assert_eq!(health["daily_count"], 6);
+        let health = &status_json(address).await["engines"];
+        assert_eq!(health[1]["last_state"], "ok");
+        assert_eq!(health[1]["daily_count"], 6);
         assert_eq!(requests.load(Ordering::SeqCst), 5);
 
-        let (status, called) = rpc(
-            base,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": "search", "arguments": {"query": "too soon"}}
-            }),
-        )
-        .await;
-        assert_eq!(status, 200);
-        let result = &called["result"];
-        assert_eq!(result["isError"], true);
-        let engine = &result["structuredContent"]["engines"][0];
-        assert_eq!(engine["state"], "limited");
-        assert_eq!(engine["daily_count"], 6);
-        assert_eq!(engine["daily_limit"], 200);
-        let ready_at = engine["ready_at"].as_str().unwrap();
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains(&format!("limited (6/200 daily) until {ready_at} (in ")),
-            "{text}"
-        );
+        let response = search_json(base, "too soon").await;
+        assert!(response.results.is_empty());
+        let [duckduckgo, bing] = response.engines.as_slice() else {
+            panic!("expected two engine states");
+        };
+        let mcp = mcp_search(base, "too soon").await;
+        assert_eq!(mcp["isError"], true);
         assert_eq!(
-            status_json(address).await["engines"][0]["last_state"],
+            mcp["structuredContent"],
+            serde_json::to_value(&response).unwrap()
+        );
+        let text = mcp["content"][0]["text"].as_str().unwrap();
+        for (index, (engine, name, state, state_text, count)) in [
+            (duckduckgo, "duckduckgo", EngineState::Blocked, "blocked", 1),
+            (bing, "bing", EngineState::Limited, "limited", 6),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(engine.name, name);
+            assert_eq!(engine.state, state);
+            assert_eq!(engine.daily_count, count);
+            assert_eq!(engine.daily_limit, 200);
+            let ready_at = engine.ready_at.as_deref().unwrap();
+            assert_eq!(health[index]["ready_at"], ready_at);
+            assert!(
+                text.contains(&format!(
+                    "{name}: {state_text} ({count}/200 daily) until {ready_at} (in "
+                )),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            status_json(address).await["engines"][1]["last_state"],
             "limited"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 5);
@@ -446,12 +530,11 @@ mod tests {
         pause();
         advance(Duration::from_secs(30)).await;
         resume();
-        let health = &status_json(address).await["engines"][0];
-        assert_eq!(health["last_state"], "limited");
+        let health = &status_json(address).await["engines"][1];
         assert!(health.get("ready_at").is_none());
         let sent = waiting.await.unwrap();
-        assert_eq!(sent.engines[0].state, EngineState::Ok);
-        assert_eq!(sent.engines[0].daily_count, 6);
+        assert_eq!(sent.engines[1].state, EngineState::Ok);
+        assert_eq!(sent.engines[1].daily_count, 6);
         assert_eq!(requests.load(Ordering::SeqCst), 6);
     }
 
@@ -490,7 +573,7 @@ mod tests {
         for _ in 0..4 {
             searcher.search("burst").await;
         }
-        let waiting = reserve_next_pace_slot(&searcher).await;
+        let waiting = reserve_next_pace_slot(&searcher, 0).await;
         assert_eq!(searcher.status().engines[0].daily_count, 6);
         release.notify_one();
         let blocking = blocking.await.unwrap();
