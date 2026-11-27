@@ -31,7 +31,7 @@ A scenario:
 5. The agent gets the results, and the state of each engine. If each engine rests, the agent gets no results, the
    state `blocked`, and the time when the engine is ready again.
 6. The owner starts the daemon with the planned `--browser` flag. The daemon can then ask Google through Chrome
-   on a virtual display.
+   on a virtual display. The owner or the agent can also send another engine, such as Bing, through Chrome.
 7. Google shows a CAPTCHA. The daemon gives the calling agent a live link to that browser on `127.0.0.1`, and the
    agent passes it to a person.
 8. The person opens the link, through an SSH tunnel from another computer, and solves the CAPTCHA. The agent
@@ -50,11 +50,14 @@ The first useful version lets a person or an agent do these things:
 - An agent can search the web through MCP over HTTP, and get results from DuckDuckGo, the default cheap HTTP
   engine. A person can turn on Bing. Brave and Mojeek are planned as opt-in engines.
   scour merges the results when two or more engines answer.
+- A planned `engines` argument will let an agent select the engines for one query, and the method of each
+  engine: HTTP or the browser (for example, `bing@browser`). The config sets the default method.
 - A person can start one daemon (`scour serve`) that all agents on the machine share, and can search from the CLI.
   A person who runs scour on a server can send the engine requests through one proxy.
 - An agent can see the state of each engine (`ok`, `empty`, `blocked`, `limited`, `parse_failed`, `error`).
   When an engine rests, the agent gets `blocked` and the time when the engine is ready again.
-- The planned `--browser` flag will enable Google. It will use headful Chrome on a virtual display (Xvfb).
+- The planned `--browser` flag will start the browser tier. A person can then turn on Google, and send any other
+  engine through the browser. The tier will use headful Chrome on a virtual display (Xvfb).
   Chrome will run in a separate process. A person will be able to connect to another Chrome instance through a CDP URL.
 - The planned browser tier will let a person solve a CAPTCHA through a live link that the agent passes on.
   A person can open the link on the machine that runs scour, or from another computer through an SSH tunnel.
@@ -81,7 +84,10 @@ solver plugin.
   each test.
 - We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 0 of 238 plain HTTP Bing
   results matched the query, while headful Chrome matched 58% on 2 of 3 queries. Brave gave HTTP 429 and Mojeek gave
-  HTTP 403. A person can turn on Bing. Brave and Mojeek are planned.
+  HTTP 403. A person can turn on Bing. A person or an agent will be able to send Bing through the planned browser
+  tier. Brave and Mojeek are planned.
+- We do not switch an engine from HTTP to the browser after a block, because a browser on the same IP gets the
+  same block. The method of each engine comes only from the config or the query.
 - We do not link a browser into the `scour` binary, because the only browser that got Google results is Chrome,
   and its installed size is 437 MB. A browser crash must also not stop the daemon. The browser runs as a child
   process.
@@ -128,9 +134,12 @@ solver plugin.
 | --- | --- | --- |
 | How does a person reach the live link when Chrome runs in Docker, with the CDP port on the loopback of the container? Which address does the daemon listen on in the container? Each answer can make the localhost invariant weaker. | The owner, in the plan of milestone 2 | The `scour:browser` image, and the handoff in Docker |
 | Does the local inspector of Chrome work with a narrow `--remote-allow-origins` value? Each spike run used `*`. | Milestone 2 | The start flags of Chrome |
-| How long does a solved Chrome session keep giving Google results? The cookie expires after approximately 3 hours. Measured only: 5 searches in 2 minutes. | Milestone 2 | How long the daemon keeps the browser and its profile after a solve |
+| How long does a solved Chrome session keep giving Google results? The cookie expires after approximately 3 hours. Measured only: 5 searches in 2 minutes. | Spike #15 | How long the daemon keeps the browser and its profile after a solve |
 | How often does a new headful Chrome session get a reCAPTCHA on its first Google query? In the browser spike, 1 of 2 sessions did. | Milestone 2 | How often Google needs a person |
 | How long does Chrome take from its start to a ready CDP port? | Milestone 2 | The idle time before the daemon stops the browser |
 | How does the Google engine get the URL of each result? The saved page uses opaque `/goto?url=` tokens for result links. The `<cite>` text lacks a full URL. One request for each result would use the Google budget. | Milestone 2 plans a spike first if the live page DOM has no result URL. | The Google engine and step 2 of the milestone 2 demo |
 | How long does an unclicked Google `/sorry/` page stay solvable? Measured only: a clicked demo widget expired after approximately 2 minutes. | Milestone 2 | `expires_at` of a challenge |
 | Does headful Chrome clear a Cloudflare challenge each time, when scour waits until the challenge ends? In the browser spike it cleared one challenge on its second load. The test was not fair to the other browsers. | The plan of milestone 3, with a spike as its first slice | The milestone that fetches a page as Markdown |
+| Does Bing give matching results to headful Chrome on most queries, with a direct `/search?q=` load? How often does it show Turnstile, can a person solve it through the live link, and which markers find it? Spike #14 made only 3 loads. | Spike #31 | The Bing `browser` method and step 6 of the milestone 2 demo |
+| Can scour drive a hidden, portable Ardia over its control socket, with no CDP port? Does it get Google and Bing results at least as often as Chrome, with less memory? How does a person solve a CAPTCHA in it? | Spike #32 | Whether the browser tier supports Ardia |
+| How many query tabs can one headful Chrome keep open at a time, and what timeout fits one browser query? One Google tab peaked at 1.7 to 2.0 GiB, and the CLI waits only 45 s. | Milestone 2 | The tab limit and the browser query timeout |
