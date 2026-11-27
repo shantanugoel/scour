@@ -60,7 +60,8 @@ flowchart LR
   An `ok` response clears rest and resets the count. An `empty`, `parse_failed` or `error` response leaves both unchanged.
   A monotonic clock controls when the next request can go out. The daemon stores a wall-clock deadline for each rest window.
   Searches during that window skip the request and return `blocked` with the same `ready_at`.
-  The CLI and MCP show the remaining time in seconds below 60 seconds, or in minutes rounded up.
+  The CLI and MCP round the remaining time up to seconds.
+  If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument

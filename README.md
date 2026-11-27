@@ -51,7 +51,8 @@ The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with co
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
 An `ok` response resets the backoff. An `empty`, `parse_failed` or `error` response leaves it unchanged.
 The blocking search and searches during the same rest window report the same `ready_at` in RFC 3339 UTC.
-The CLI and MCP text show the timestamp and the remaining time in seconds below 60 seconds, or in minutes rounded up.
+The CLI and MCP text show the timestamp and the remaining time rounded up to seconds.
+If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 
 ## Use MCP
 

@@ -39,7 +39,7 @@ pub async fn search(query: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let presented = present(&parsed);
+    let presented = present(&parsed, Utc::now());
     if !presented.stdout.is_empty() {
         print!("{}", presented.stdout);
     }
@@ -55,7 +55,7 @@ pub async fn search(query: &str) -> ExitCode {
 
 /// The whole answer as one text, for a caller that has no separate error stream, such as MCP.
 pub fn render(response: &SearchResponse) -> String {
-    let presented = present(response);
+    let presented = present(response, Utc::now());
     format!("{}{}", presented.stdout, presented.stderr)
 }
 
@@ -65,7 +65,7 @@ struct Presented {
     success: bool,
 }
 
-fn present(response: &SearchResponse) -> Presented {
+fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
     let mut stdout = String::new();
     let mut stderr = String::new();
     for (index, result) in response.results.iter().enumerate() {
@@ -99,7 +99,7 @@ fn present(response: &SearchResponse) -> Presented {
                     .ready_at
                     .as_deref()
                     .map_or_else(String::new, |ready_at| {
-                        format!(" until {ready_at}{}", remaining_time(ready_at))
+                        format!(" until {ready_at}{}", remaining_time(ready_at, now))
                     });
                 stderr.push_str(&format!("scour: {}: blocked{rest}\n", engine.name));
             }
@@ -122,15 +122,13 @@ fn present(response: &SearchResponse) -> Presented {
     }
 }
 
-fn remaining_time(ready_at: &str) -> String {
+fn remaining_time(ready_at: &str, now: DateTime<Utc>) -> String {
     let Ok(deadline) = DateTime::parse_from_rfc3339(ready_at) else {
         return String::new();
     };
-    let remaining = (deadline.to_utc() - Utc::now())
-        .to_std()
-        .unwrap_or_default();
+    let remaining = (deadline.to_utc() - now).to_std().unwrap_or_default();
     let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-    if remaining.as_secs() < 60 {
+    if seconds < 60 {
         format!(" (in {seconds} s)")
     } else {
         format!(" (in {} min)", seconds.div_ceil(60))
@@ -202,7 +200,7 @@ mod tests {
                 ready_at: None,
             }],
         };
-        let presented = present(&response);
+        let presented = present(&response, Utc::now());
         assert!(presented.success);
         assert!(presented.stderr.is_empty());
         assert_eq!(
@@ -223,7 +221,7 @@ mod tests {
                 ready_at: None,
             }],
         };
-        let presented = present(&response);
+        let presented = present(&response, Utc::now());
         assert!(!presented.success);
         assert!(presented.stdout.is_empty());
         assert_eq!(
@@ -250,7 +248,7 @@ mod tests {
                     ready_at: None,
                 }],
             };
-            let presented = present(&response);
+            let presented = present(&response, Utc::now());
             assert!(!presented.success, "{name}");
             assert!(presented.stdout.is_empty(), "{name}");
             assert!(
@@ -266,6 +264,38 @@ mod tests {
     }
 
     #[test]
+    fn blocked_answer_formats_countdown_using_rounded_seconds() {
+        let ready_at = "2026-01-01T00:01:01Z";
+        let deadline = ready_at.parse::<DateTime<Utc>>().expect("valid deadline");
+        let response = SearchResponse {
+            query: "x".to_string(),
+            results: Vec::new(),
+            engines: vec![EngineStatus {
+                name: "duckduckgo".to_string(),
+                state: EngineState::Blocked,
+                error: None,
+                ready_at: Some(ready_at.to_string()),
+            }],
+        };
+
+        for (milliseconds, countdown) in [
+            (58_001, "59 s"),
+            (59_000, "59 s"),
+            (59_001, "1 min"),
+            (60_000, "1 min"),
+            (61_000, "2 min"),
+        ] {
+            let now = deadline - chrono::TimeDelta::milliseconds(milliseconds);
+            let presented = present(&response, now);
+            assert_eq!(
+                presented.stderr,
+                format!("scour: duckduckgo: blocked until {ready_at} (in {countdown})\n"),
+                "{milliseconds} ms remaining"
+            );
+        }
+    }
+
+    #[test]
     fn empty_answer_prints_empty_not_ok() {
         let response = SearchResponse {
             query: "x".to_string(),
@@ -277,7 +307,7 @@ mod tests {
                 ready_at: None,
             }],
         };
-        let presented = present(&response);
+        let presented = present(&response, Utc::now());
         assert!(presented.success);
         assert!(presented.stderr.is_empty());
         assert_eq!(presented.stdout, "bing: empty (0 results)\n");
@@ -318,7 +348,7 @@ mod tests {
                 },
             ],
         };
-        let presented = present(&response);
+        let presented = present(&response, Utc::now());
         assert!(presented.success);
         assert!(presented.stdout.contains("duckduckgo: ok (1 results)\n"));
         assert!(presented.stdout.contains("bing: ok (1 results)\n"));
