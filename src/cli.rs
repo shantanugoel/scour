@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use crate::api::{ADDR, EngineState, SearchResponse};
 
 /// Two engines can each take the 10 s search timeout, so wait longer than 20 s.
@@ -93,7 +95,13 @@ fn present(response: &SearchResponse) -> Presented {
                 stdout.push_str(&format!("{}: empty ({count} results)\n", engine.name));
             }
             EngineState::Blocked => {
-                stderr.push_str(&format!("scour: {}: blocked\n", engine.name));
+                let rest = engine
+                    .ready_at
+                    .as_deref()
+                    .map_or_else(String::new, |ready_at| {
+                        format!(" until {ready_at}{}", remaining_time(ready_at))
+                    });
+                stderr.push_str(&format!("scour: {}: blocked{rest}\n", engine.name));
             }
             EngineState::ParseFailed => {
                 stderr.push_str(&format!("scour: {}: parse_failed\n", engine.name));
@@ -111,6 +119,21 @@ fn present(response: &SearchResponse) -> Presented {
         stdout,
         stderr,
         success,
+    }
+}
+
+fn remaining_time(ready_at: &str) -> String {
+    let Ok(deadline) = DateTime::parse_from_rfc3339(ready_at) else {
+        return String::new();
+    };
+    let remaining = (deadline.to_utc() - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    if remaining.as_secs() < 60 {
+        format!(" (in {seconds} s)")
+    } else {
+        format!(" (in {} min)", seconds.div_ceil(60))
     }
 }
 
@@ -176,6 +199,7 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Ok,
                 error: None,
+                ready_at: None,
             }],
         };
         let presented = present(&response);
@@ -196,6 +220,7 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Error,
                 error: Some("cannot connect to www.bing.com".to_string()),
+                ready_at: None,
             }],
         };
         let presented = present(&response);
@@ -222,6 +247,7 @@ mod tests {
                     name: "duckduckgo".to_string(),
                     state,
                     error: None,
+                    ready_at: None,
                 }],
             };
             let presented = present(&response);
@@ -248,6 +274,7 @@ mod tests {
                 name: "bing".to_string(),
                 state: EngineState::Empty,
                 error: None,
+                ready_at: None,
             }],
         };
         let presented = present(&response);
@@ -281,11 +308,13 @@ mod tests {
                     name: "duckduckgo".to_string(),
                     state: EngineState::Ok,
                     error: None,
+                    ready_at: None,
                 },
                 EngineStatus {
                     name: "bing".to_string(),
                     state: EngineState::Ok,
                     error: None,
+                    ready_at: None,
                 },
             ],
         };

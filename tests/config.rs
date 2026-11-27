@@ -66,6 +66,52 @@ fn unknown_key_exits_one() {
 }
 
 #[test]
+fn a_test_url_for_an_engine_that_is_not_enabled_exits_one() {
+    for name in ["bing", "unknown"] {
+        let path = config_file(
+            name,
+            &format!("[testing.base_urls]\n{name} = \"http://127.0.0.1:8000\"\n"),
+        );
+        let output = serve_with_config(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_exit_one(
+            &output,
+            &format!("testing.base_urls engine `{name}` is not enabled"),
+        );
+    }
+}
+
+#[test]
+fn invalid_testing_settings_exit_one_without_echoing_values() {
+    for (settings, expected) in [
+        (
+            "rest_seconds = 0",
+            "testing.rest_seconds must be greater than zero",
+        ),
+        (
+            "rest_seconds = -1",
+            "testing.rest_seconds must be greater than zero",
+        ),
+        ("rest_second = 10", "unknown field `rest_second`"),
+        (r#"rest_seconds = "hunter2""#, "invalid type: string"),
+        (
+            r#"base_urls.duckduckgo = "file:///hunter2""#,
+            "testing.base_urls.duckduckgo must be an HTTP or HTTPS URL",
+        ),
+        (
+            r#"base_urls.duckduckgo = "http://hunter2@""#,
+            "testing.base_urls.duckduckgo must be an HTTP or HTTPS URL",
+        ),
+    ] {
+        let path = config_file("invalid-testing", &format!("[testing]\n{settings}\n"));
+        let output = serve_with_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let stderr = assert_exit_one(&output, expected);
+        assert!(!stderr.contains("hunter2"), "{stderr}");
+    }
+}
+
+#[test]
 fn unknown_engine_exits_one() {
     let path = config_file("unknown-engine", "engines = [\"google\"]\n");
     let output = serve_with_config(&path);

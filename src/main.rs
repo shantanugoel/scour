@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod config;
 mod engines;
+mod limits;
 mod mcp;
 mod search;
 

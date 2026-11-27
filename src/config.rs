@@ -1,19 +1,26 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+use url::Url;
 
 use crate::engines::{self, Engine, duckduckgo};
 
 #[derive(Debug)]
 pub struct Config {
     pub engines: Vec<&'static Engine>,
+    pub base_urls: HashMap<&'static str, Url>,
+    pub rest: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             engines: vec![&duckduckgo::ENGINE],
+            base_urls: HashMap::new(),
+            rest: Duration::from_secs(600),
         }
     }
 }
@@ -22,6 +29,16 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct File {
     engines: Option<Vec<String>>,
+    #[serde(default)]
+    testing: Testing,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Testing {
+    rest_seconds: Option<i64>,
+    #[serde(default)]
+    base_urls: HashMap<String, String>,
 }
 
 pub fn load(path: Option<&Path>) -> Result<Config, String> {
@@ -64,9 +81,30 @@ fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<
 
 fn parse(text: &str) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|err| toml_error(&err, text))?;
-    let Some(names) = file.engines else {
-        return Ok(Config::default());
-    };
+    let mut config = Config::default();
+    if let Some(names) = file.engines {
+        config.engines = select_engines(names)?;
+    }
+    if let Some(seconds) = file.testing.rest_seconds {
+        if seconds <= 0 {
+            return Err("testing.rest_seconds must be greater than zero".to_string());
+        }
+        config.rest = Duration::from_secs(seconds as u64);
+    }
+    for (name, value) in file.testing.base_urls {
+        let Some(engine) = config.engines.iter().find(|engine| engine.name == name) else {
+            return Err(format!("testing.base_urls engine `{name}` is not enabled"));
+        };
+        let url = Url::parse(&value)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            .ok_or_else(|| format!("testing.base_urls.{name} must be an HTTP or HTTPS URL"))?;
+        config.base_urls.insert(engine.name, url);
+    }
+    Ok(config)
+}
+
+fn select_engines(names: Vec<String>) -> Result<Vec<&'static Engine>, String> {
     if names.is_empty() {
         return Err("the engines list is empty".to_string());
     }
@@ -80,12 +118,16 @@ fn parse(text: &str) -> Result<Config, String> {
         }
         selected.push(engine);
     }
-    Ok(Config { engines: selected })
+    Ok(selected)
 }
 
 /// The source line can hold a secret. Show only the parser message and the line number.
 fn toml_error(err: &toml::de::Error, text: &str) -> String {
-    let message = err.message();
+    let mut message = err.message();
+    if message.starts_with("invalid type: string ") {
+        // Serde includes the unexpected string in this diagnostic.
+        message = "invalid type: string";
+    }
     let Some(span) = err.span() else {
         return format!("cannot read the config: {message}");
     };

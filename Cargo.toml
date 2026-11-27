@@ -12,7 +12,8 @@ name = "scour"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt", "net"] }
+tokio = { version = "1", features = ["macros", "rt", "net", "time"] }
+chrono = { version = "0.4", default-features = false, features = ["now"] }
 axum = "0.8"
 wreq = { version = "0.16", features = ["json", "gzip", "brotli", "deflate", "zstd"] }
 wreq-util = { version = "0.2", features = ["emulation", "emulation-compression"] }
@@ -26,4 +27,4 @@ base64 = "0.22"
 rmcp = { version = "3.12", features = ["server", "macros", "transport-streamable-http-server"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "test-util"] }

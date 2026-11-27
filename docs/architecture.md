@@ -35,7 +35,7 @@ flowchart LR
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
-| Engine state | Each engine reports the outcome of its request. DuckDuckGo recognizes challenge and no-results pages. Rest timers, rate limits and daily counts are planned. | Rust, in memory | built for DuckDuckGo and Bing |
+| Engine state | Each engine reports its request outcome and rests after a block. Rate limits and daily counts are planned. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike. | Rust tests | built for DuckDuckGo and Bing |
 | Packaging | Has two Docker images. `scour` has only the binary and the cheap engines. `scour:browser` adds Chrome and Xvfb. The installed Chromium of the browser spike is 437 MB, so `scour:browser` is several hundred MB. The image size is not measured yet. On a Linux host without Docker, the user installs Chrome and Xvfb, and sets the path of Chrome. | Docker, static musl binary | planned |
@@ -44,7 +44,8 @@ flowchart LR
 
 - **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
   `content`, `engine` and `position`, and `engines[]` with `name` and `state`. `engines[].error` is present only
-  when the state is `error`. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
+  when the state is `error`. `engines[].ready_at` is present when the state is `blocked`. It is an RFC 3339 UTC
+  timestamp to the second. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
   planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
   compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
   `format=json` still works.
@@ -55,6 +56,11 @@ flowchart LR
   DuckDuckGo pages give `parse_failed`. Bing reports `empty` when its parser finds no results on HTTP 200.
   The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns
   `ok` or `empty`.
+- **Rest.** The first block starts a 10-minute rest by default. Each consecutive block doubles that duration, up to 4 hours.
+  An `ok` response clears rest and resets the count. An `empty`, `parse_failed` or `error` response leaves both unchanged.
+  A monotonic clock controls when the next request can go out. The daemon stores a wall-clock deadline for each rest window.
+  Searches during that window skip the request and return `blocked` with the same `ready_at`.
+  The CLI and MCP show the remaining time in seconds below 60 seconds, or in minutes rounded up.
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
@@ -87,14 +93,16 @@ flowchart LR
   or `$HOME/.config/scour/config.toml`. The `engines` key is a list; it defaults to `["duckduckgo"]`, and a person
   can add `bing`. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
   The same exit code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing
-  `--config` file. A TOML error shows the parser message and the line number, never the source line, so a secret in
-  the file cannot leak. The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
+  `--config` file. A TOML error shows a redacted parser message and the line number.
+  For local tests, `[testing].rest_seconds` sets a positive base duration.
+  `[testing.base_urls]` maps enabled engine names to HTTP or HTTPS URLs. Unknown and disabled engine keys fail at startup.
+  The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
   for Docker. That change makes the localhost invariant weaker for that case, so the owner decides it then.
 - **State.** The daemon writes no query and no result to disk. It prints one start line and no query. It installs
-  no `tracing` subscriber, so a library log call cannot print a query. Rest timers and daily counts are planned,
-  and they will live in memory. The browser profile is planned. The daemon
-  will delete it when the browser stops. The `GOOGLE_ABUSE_EXEMPTION` cookie lives only in that profile, so a
-  browser stop ends the solved session.
+  no `tracing` subscriber, so a library log call cannot print a query. Rest timers and block counts live in memory.
+  Each engine has its own mutex. The code releases it before any network request.
+  Daily counts and the browser profile are planned. The daemon will delete the profile when the browser stops.
+  The `GOOGLE_ABUSE_EXEMPTION` cookie lives only in that profile, so a browser stop ends the solved session.
 - **Between the parts.** The CLI talks to the daemon with HTTP JSON. The daemon does not talk to a browser yet.
   That path is CDP over WebSocket on `127.0.0.1`, and it is planned. A solver plugin is planned for after the first release. It
   would use JSON on stdin and stdout, or a JSON POST.

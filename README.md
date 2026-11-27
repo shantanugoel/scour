@@ -42,11 +42,16 @@ The CLI, JSON API and MCP report a state for each engine.
 | --- | --- |
 | `ok` | The engine returned results. |
 | `empty` | DuckDuckGo showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
-| `blocked` | The engine returned HTTP 403 or 429, or DuckDuckGo showed a challenge page at any HTTP status. |
+| `blocked` | The engine is resting, returned HTTP 403 or 429, or DuckDuckGo showed a challenge page. |
 | `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. |
 | `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
 
 The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns `ok` or `empty`.
+
+After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
+An `ok` response resets the backoff. An `empty`, `parse_failed` or `error` response leaves it unchanged.
+The blocking search and searches during the same rest window report the same `ready_at` in RFC 3339 UTC.
+The CLI and MCP text show the timestamp and the remaining time in seconds below 60 seconds, or in minutes rounded up.
 
 ## Use MCP
 
@@ -83,9 +88,21 @@ Or start the daemon with a file:
 ```
 
 The `engines` list accepts `duckduckgo` and `bing`. Invalid TOML stops the daemon with exit code 1. The same exit
-code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing `--config` file. A
-TOML error prints the parser message and the line number, not the line text. Thus a secret in the file does not
-appear in the terminal.
+code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing `--config` file.
+A TOML error shows a redacted parser message and the line number.
+
+For local testing, set a positive base rest duration in seconds and point enabled engines at test servers.
+
+```toml
+[testing]
+rest_seconds = 5
+
+[testing.base_urls]
+duckduckgo = "http://127.0.0.1:8080"
+```
+
+Each URL must use HTTP or HTTPS. A key for an unknown or disabled engine stops the daemon with exit code 1.
+Each engine still uses its normal search path and query parameters.
 
 ## Check
 
@@ -95,8 +112,7 @@ Run:
 scripts/check
 ```
 
-The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests make no request
-to an engine.
+The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests use saved pages and loopback servers.
 
 ## Size and memory
 
