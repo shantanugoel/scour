@@ -3,17 +3,17 @@
 scour is a local search tool. One daemon asks DuckDuckGo by default. You and your agents use that daemon.
 A person can turn on Bing in a configuration file.
 
-scour is for personal use, and nobody must run it as a public instance.
+scour is for personal use. Do not run scour as a public instance.
 
 ## Build
 
-1. Install Rust.
+1. Install Rust 1.98 or later, `cmake`, a C/C++ toolchain and `libclang`.
 2. Unset `LIBCLANG_PATH` if it points at another clang. An ESP clang makes the build look for a 32-bit header.
 3. In this directory, run:
 
-```sh
-cargo build --release --locked
-```
+   ```sh
+   cargo build --release --locked
+   ```
 
 The program is `target/release/scour`.
 
@@ -21,20 +21,26 @@ The program is `target/release/scour`.
 
 The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 
-1. Start the daemon:
+1. Start the daemon.
 
-```sh
-./target/release/scour serve
-```
+   ```sh
+   ./target/release/scour serve
+   ```
 
-2. In a second terminal, search:
+2. Run a search in a second terminal.
 
-```sh
-./target/release/scour search "rust async runtime"
-```
+   ```sh
+   ./target/release/scour search "rust async runtime"
+   ```
 
-The command prints 5 or more results. Each result has a title, a URL and a snippet. The URL is the address of the
-result site. The last line names the engine `duckduckgo` and the state `ok`.
+3. Check engine status without sending a search.
+
+   ```sh
+   ./target/release/scour status
+   ```
+
+`scour search` prints the results that the engines return. With only DuckDuckGo enabled, its saved page gives 10 results.
+Each result has a title, a URL and a snippet. The URL is the address of the result site.
 
 When several engines are enabled, the daemon queries them in parallel. It reports their states in config order.
 The daemon takes one result from each engine in config order, then repeats for each rank.
@@ -66,12 +72,6 @@ Both `blocked` and `limited` search responses give a `ready_at` time.
 The CLI and MCP text show the timestamp and the remaining time rounded up to seconds.
 If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 
-3. Check engine status without sending a search.
-
-```sh
-./target/release/scour status
-```
-
 `GET /status` returns each engine's name, last state, daily count and daily limit.
 Before the first search, the CLI shows `idle` and the JSON field `last_state` is `null`.
 Status shows `ready_at` for active rest, a full daily window, or a pace wait longer than 30 seconds.
@@ -91,9 +91,10 @@ claude mcp add --transport http scour http://127.0.0.1:7268/mcp
 
 The tool description tells the agent that result titles and snippets are untrusted web text.
 
-The daemon answers only a local request. The `Host` name must be `127.0.0.1` or `localhost`, with any port. The
-`Origin` must be absent, or `http://127.0.0.1[:port]`, or `http://localhost[:port]`. Any other request gets HTTP
-403 with `{"error":"the Host or Origin is not local"}`. This stops a web page from reaching the daemon through a
+The daemon requires exactly one `Host` header with `127.0.0.1` or `localhost`, with any valid port.
+A request can have at most one `Origin` header. If present, it must be `http://127.0.0.1[:port]` or
+`http://localhost[:port]`. The daemon rejects requests that fail these checks with HTTP 403 and
+`{"error":"the Host or Origin is not local"}`. This stops a web page from reaching the daemon through a
 name that points at `127.0.0.1` (DNS rebinding).
 
 ## Configure
@@ -147,13 +148,15 @@ Each engine still uses its normal search path and query parameters.
 
 ## Check
 
-Run:
+1. Stop any running `scour serve` daemon. A config test binds to `127.0.0.1:7268`.
+2. Run the check.
 
-```sh
-scripts/check
-```
+   ```sh
+   scripts/check
+   ```
 
-The command checks the format, runs clippy with warnings as errors, and runs the tests. The tests use saved pages and loopback servers.
+The command checks the format and runs Clippy with warnings as errors.
+It also runs the tests, which use saved pages and loopback servers.
 
 ## Size and memory
 
