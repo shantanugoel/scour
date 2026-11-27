@@ -30,12 +30,12 @@ flowchart LR
 | --- | --- | --- | --- |
 | Daemon | Serves the JSON API and MCP on `127.0.0.1:7268` only. One layer rejects every request with a foreign `Host` or `Origin`. | `tokio`, `axum` | built |
 | MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The tool description warns that titles and snippets are untrusted web text. A per-query `engines` argument and the open challenges are planned. | `rmcp` (streamable HTTP, stateless JSON) | built |
-| JSON API and CLI | `GET /search` returns JSON. `scour search "q"` is a client of this API in the same binary. | `axum`, `wreq` | built |
+| JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. | `axum`, `wreq` | built |
 | Cascade | Selects the engines for a query and skips each engine that rests or is at its limit. It sends each HTTP engine through the HTTP tier, and each browser-only engine (Google) through the browser tier. It does not send a blocked HTTP engine to the browser, because a browser on a blocked IP does not help. It merges the results and removes duplicate URLs. | Rust | planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned for the browser tier. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. | `scraper` | built for DuckDuckGo and Bing |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 only. One optional proxy is planned. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Page \| Challenge`. It starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
-| Engine state | Each engine reports its request outcome and rests after a block. Rate limits and daily counts are planned. | Rust, in memory | built for DuckDuckGo and Bing |
+| Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike. | Rust tests | built for DuckDuckGo and Bing |
 | Packaging | Has two Docker images. `scour` has only the binary and the cheap engines. `scour:browser` adds Chrome and Xvfb. The installed Chromium of the browser spike is 437 MB, so `scour:browser` is several hundred MB. The image size is not measured yet. On a Linux host without Docker, the user installs Chrome and Xvfb, and sets the path of Chrome. | Docker, static musl binary | planned |
@@ -43,8 +43,9 @@ flowchart LR
 ## Data
 
 - **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
-  `content`, `engine` and `position`, and `engines[]` with `name` and `state`. `engines[].error` is present only
-  when the state is `error`. `engines[].ready_at` is present when the state is `blocked`. It is an RFC 3339 UTC
+  `content`, `engine` and `position`, and `engines[]` with `name`, `state`, `daily_count` and `daily_limit`.
+  `engines[].error` is present only when the state is `error`. `engines[].ready_at` is present for `blocked`
+  and `limited`. It is an RFC 3339 UTC
   timestamp to the second. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
   planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
   compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
@@ -54,7 +55,7 @@ flowchart LR
   non-200 response gives `error` with `HTTP <n>`. Network failures and timeouts also give `error`.
   On HTTP 200, parsed results give `ok`. A DuckDuckGo no-results marker gives `empty`. Unrecognized
   DuckDuckGo pages give `parse_failed`. Bing reports `empty` when its parser finds no results on HTTP 200.
-  The CLI prints `blocked`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns
+  The CLI prints `blocked`, `limited`, `parse_failed` and `error` to stderr. It exits with code 1 if no engine returns
   `ok` or `empty`.
 - **Rest.** The first block starts a 10-minute rest by default. Each consecutive block doubles that duration, up to 4 hours.
   An `ok` response clears rest and resets the count. An `empty`, `parse_failed` or `error` response leaves both unchanged.
@@ -62,6 +63,16 @@ flowchart LR
   Searches during that window skip the request and return `blocked` with the same `ready_at`.
   The CLI and MCP round the remaining time up to seconds.
   If the rounded time is 60 seconds or more, they show it in minutes rounded up.
+- **Pace and daily limits.** Admission checks active rest first, then the 200-request rolling limit, then pace.
+  Each engine starts with five tokens and refills one every 30 seconds, up to five.
+  If the next token is more than 30 seconds away, admission returns `limited` with that token's time.
+  Otherwise, admission reserves the token and adds the request to the daily count. It releases the lock before any wait.
+  If rest begins during the wait, the daemon cancels the send and refunds its daily reservation.
+  Failed sends count. At the daily limit, `ready_at` is the oldest request's admission time plus 24 hours.
+- **Status.** `GET /status` returns `engines[]` in config order, with `name`, `last_state`, `daily_count` and `daily_limit`.
+  `last_state` starts as `null` and tracks search outcomes, including requests skipped during rest or at a limit.
+  `ready_at` appears only during active rest, at the daily limit, or when the next pace slot is more than 30 seconds away.
+  `scour status` prints this snapshot, which sends no engine requests.
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
@@ -69,7 +80,7 @@ flowchart LR
   the `scour search` text in `content[0].text`. A blank query sets `isError: true` and returns only the error
   message in `content[0].text`. A search answer sets `isError: true` when no engine is `ok` or `empty`.
   A blank query sends no engine request. The server reports `serverInfo` as `scour`.
-- **Local-only guard.** One `Router::layer` wraps every route, including `/mcp`, `/search` and an unknown path. A
+- **Local-only guard.** One `Router::layer` wraps every route, including `/mcp`, `/search`, `/status` and unknown paths. A
   request requires one `Host` header with `127.0.0.1[:port]` or `localhost[:port]`. An optional `Origin` header
   must appear at most once and use `http://127.0.0.1[:port]` or `http://localhost[:port]`. Each optional port
   must contain only digits and have a value from 0 to 65535. Any other request gets HTTP 403 with
@@ -100,9 +111,9 @@ flowchart LR
   The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
   for Docker. That change makes the localhost invariant weaker for that case, so the owner decides it then.
 - **State.** The daemon writes no query and no result to disk. It prints one start line and no query. It installs
-  no `tracing` subscriber, so a library log call cannot print a query. Rest timers and block counts live in memory.
-  Each engine has its own mutex. The code releases it before any network request.
-  Daily counts and the browser profile are planned. The daemon will delete the profile when the browser stops.
+  no `tracing` subscriber, so a library log call cannot print a query. Engine limits and health live in memory.
+  Each engine has its own mutex. The code releases it before any wait or network request.
+  The browser profile is planned. The daemon will delete the profile when the browser stops.
   The `GOOGLE_ABUSE_EXEMPTION` cookie lives only in that profile, so a browser stop ends the solved session.
 - **Between the parts.** The CLI talks to the daemon with HTTP JSON. The daemon does not talk to a browser yet.
   That path is CDP over WebSocket on `127.0.0.1`, and it is planned. A solver plugin is planned for after the first release. It
@@ -124,8 +135,8 @@ flowchart LR
   Headful Chrome matched 58% on 2 of 3 queries, so the client causes the mismatch. Brave gave HTTP 429 with a
   CAPTCHA, Mojeek gave HTTP 403, and Startpage, Qwant, Yahoo and Ecosia gave no results. We did not keep Bing as a
   default, because a result that does not match the query is worse than no result: the agent cannot see the
-  difference. When the only enabled engine reports a block, the answer has no results. The planned pace and
-  daily limits will reduce the chance of a block.
+  difference. When the only enabled engine reports a block, the answer has no results. Pace and daily limits
+  reduce the chance of a block.
 - **The CDP client in the daemon.** `chromiumoxide` drives Chrome through all steps of a Google search, so
   `headless_chrome` is not necessary. A CDP endpoint is the replaceable boundary: a user can give the CDP URL of
   another browser. The handoff link comes from the same CDP server.

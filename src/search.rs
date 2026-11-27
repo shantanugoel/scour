@@ -2,14 +2,16 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
-use tokio::time::Instant;
+use chrono::{DateTime, SecondsFormat, Utc};
+use tokio::time::{Instant, sleep_until};
 use url::Url;
 
-use crate::api::{EngineState, EngineStatus, ResultItem, SearchResponse};
+use crate::api::{
+    EngineHealth, EngineState, EngineStatus, ResultItem, SearchResponse, StatusResponse,
+};
 use crate::config::Config;
 use crate::engines::{Engine, Hit, Page};
-use crate::limits::{Admit, Limits};
+use crate::limits::{Admit, DAILY_LIMIT, Limits};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -75,25 +77,7 @@ impl Searcher {
         let mut engines = Vec::with_capacity(self.engines.len());
         for slot in &self.engines {
             let engine = slot.engine;
-            let admit = slot
-                .limits
-                .lock()
-                .expect("engine limits")
-                .admit(Instant::now(), Utc::now());
-            let (answer, ready_at) = match admit {
-                Admit::Resting(ready_at) => {
-                    (Answer::without_hits(EngineState::Blocked), Some(ready_at))
-                }
-                Admit::Send => {
-                    let answer = self.fetch(slot, query).await;
-                    let ready_at = slot.limits.lock().expect("engine limits").record(
-                        answer.state,
-                        Instant::now(),
-                        Utc::now(),
-                    );
-                    (answer, ready_at)
-                }
-            };
+            let (answer, ready_at) = self.search_engine(slot, query).await;
             if let Some(hits) = answer.hits {
                 for hit in hits {
                     let position = (results.len() + 1) as u32;
@@ -109,8 +93,14 @@ impl Searcher {
             engines.push(EngineStatus {
                 name: engine.name.to_string(),
                 state: answer.state,
+                daily_count: slot
+                    .limits
+                    .lock()
+                    .expect("engine limits")
+                    .daily_count(Instant::now()),
+                daily_limit: DAILY_LIMIT,
                 error: answer.error,
-                ready_at: ready_at.map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                ready_at: ready_at.map(format_deadline),
             });
         }
         SearchResponse {
@@ -118,6 +108,65 @@ impl Searcher {
             results,
             engines,
         }
+    }
+
+    pub fn status(&self) -> StatusResponse {
+        let engines = self
+            .engines
+            .iter()
+            .map(|slot| {
+                let limits = slot.limits.lock().expect("engine limits");
+                let now = Instant::now();
+                EngineHealth {
+                    name: slot.engine.name.to_string(),
+                    last_state: limits.last_state(),
+                    daily_count: limits.daily_count(now),
+                    daily_limit: DAILY_LIMIT,
+                    ready_at: limits.peek(now).map(format_deadline),
+                }
+            })
+            .collect();
+        StatusResponse { engines }
+    }
+
+    async fn search_engine(
+        &self,
+        slot: &EngineSlot,
+        query: &str,
+    ) -> (Answer, Option<DateTime<Utc>>) {
+        let (now, wall, admit) = {
+            let mut limits = slot.limits.lock().expect("engine limits");
+            let now = Instant::now();
+            let wall = Utc::now();
+            (now, wall, limits.admit(now, wall))
+        };
+        let send_at = match admit {
+            Admit::Resting(ready_at) => {
+                return (Answer::without_hits(EngineState::Blocked), Some(ready_at));
+            }
+            Admit::Limited(ready_at) => {
+                return (Answer::without_hits(EngineState::Limited), Some(ready_at));
+            }
+            Admit::SendAt(send_at) => send_at,
+        };
+        if send_at > now {
+            sleep_until(send_at).await;
+            let ready_at = slot
+                .limits
+                .lock()
+                .expect("engine limits")
+                .confirm_send(Instant::now(), (now, wall));
+            if ready_at.is_some() {
+                return (Answer::without_hits(EngineState::Blocked), ready_at);
+            }
+        }
+        let answer = self.fetch(slot, query).await;
+        let ready_at = slot.limits.lock().expect("engine limits").record(
+            answer.state,
+            Instant::now(),
+            Utc::now(),
+        );
+        (answer, ready_at)
     }
 
     async fn fetch(&self, slot: &EngineSlot, query: &str) -> Answer {
@@ -145,6 +194,10 @@ impl Searcher {
             Err(err) => Answer::error(fetch_error(&err, host)),
         }
     }
+}
+
+fn format_deadline(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
@@ -507,6 +560,10 @@ mod tests {
         assert_eq!(response.engines.len(), 1);
         assert_eq!(response.engines[0].name, "bing");
         assert_eq!(response.engines[0].state, EngineState::Error);
+        assert_eq!(response.engines[0].daily_count, 1);
+        let health = &searcher.status().engines[0];
+        assert_eq!(health.last_state, Some(EngineState::Error));
+        assert_eq!(health.daily_count, 1);
         assert_eq!(
             response.engines[0].error.as_deref(),
             Some("cannot connect to www.bing.com")
