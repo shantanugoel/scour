@@ -1,15 +1,15 @@
 # Architecture
 
 scour is one Rust binary. It runs as one local daemon (`scour serve`), and the agents on the machine use it.
-Today the daemon asks DuckDuckGo by default and Bing only if a person turns it on. It uses an HTTP client that has
+The daemon asks DuckDuckGo by default and Bing only if a person turns it on. It uses an HTTP client that has
 a browser TLS fingerprint. It listens only on `127.0.0.1:7268`. No flag, variable or file changes that address.
-An agent searches through MCP over streamable HTTP at `/mcp`. A cascade and a browser for Google are planned too.
-The browser is headful Chrome on Xvfb (a virtual display). It runs as a child process, and the daemon drives it
-through CDP (the Chrome DevTools Protocol) with `chromiumoxide`.
+An agent searches through MCP over streamable HTTP at `/mcp`.
+The planned browser tier will run headful Chrome on Xvfb (a virtual display) as a child process.
+The daemon will drive Chrome through CDP (the Chrome DevTools Protocol) with `chromiumoxide`.
 
 The main reason for this shape: blocks come mostly from the IP and from the fingerprint, not from the tool. Thus
 most queries use the cheap tier. The release binary is 17657880 bytes. The idle daemon uses 11.0 MiB of memory.
-Only a Google query pays for a browser.
+The planned cascade will use the browser tier only for Google queries.
 
 ## Context
 
@@ -70,9 +70,11 @@ flowchart LR
   Searches during that window skip the request and return `blocked` with the same `ready_at`.
   The CLI and MCP round the remaining time up to seconds.
   If the rounded time is 60 seconds or more, they show it in minutes rounded up.
+- **Request limits.** Each engine HTTP request has a 10-second timeout and a limit of 10 redirects.
+  The CLI waits up to 45 seconds for a response from the daemon.
 - **Pace and daily limits.** Admission checks active rest first, then the 200-request rolling limit, then pace.
   Each engine starts with five tokens and refills one every 30 seconds, up to five.
-  If the next token is more than 30 seconds away, admission returns `limited` with that token's time.
+  If the next token is more than 30 seconds away, the engine reports `limited` with the time it can next send.
   Otherwise, admission reserves the token and adds the request to the daily count. It releases the lock before any wait.
   If rest begins during the wait, the daemon cancels the send and refunds its daily reservation.
   Failed sends count. At the daily limit, `ready_at` is the oldest request's admission time plus 24 hours.
