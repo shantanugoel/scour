@@ -53,6 +53,8 @@ pub struct EngineStatus {
     pub state: EngineState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +143,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{advance, pause, resume};
 
     use crate::config::Config;
     use crate::engines::{Engine, Hit, Page};
@@ -209,6 +213,7 @@ mod tests {
         Arc::new(
             Searcher::new(&Config {
                 engines: vec![engine],
+                ..Config::default()
             })
             .expect("client"),
         )
@@ -250,6 +255,69 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_str(&text).expect("search answer")
+    }
+
+    #[tokio::test]
+    async fn configured_engine_skips_requests_until_its_block_rest_expires() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = axum::Router::new().route(
+            "/html/",
+            axum::routing::get(move || {
+                let index = counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if index == 0 {
+                        include_str!("../fixtures/duckduckgo/blocked.html")
+                    } else {
+                        include_str!("../fixtures/duckduckgo/results.html")
+                    }
+                }
+            }),
+        );
+        let (engine_base, _) = serve(app).await;
+        let path = std::env::temp_dir().join(format!("scour-rest-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("[testing]\nrest_seconds = 20\nbase_urls.duckduckgo = \"{engine_base}\"\n"),
+        )
+        .unwrap();
+        let config = crate::config::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        let searcher = Searcher::new(&config.unwrap()).unwrap();
+        let (base, _) = serve(router(Arc::new(searcher))).await;
+
+        let before = Utc::now();
+        let blocked = search_json(base, "rust async runtime").await;
+        let after = Utc::now();
+        assert_eq!(blocked.engines[0].state, EngineState::Blocked);
+        let ready_at = blocked.engines[0].ready_at.as_deref().unwrap();
+        let deadline = DateTime::parse_from_rfc3339(ready_at).unwrap().to_utc();
+        assert_eq!(
+            ready_at,
+            deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
+        );
+        assert!(deadline > before + TimeDelta::seconds(19));
+        assert!(deadline <= after + TimeDelta::seconds(20));
+        let text = crate::cli::render(&blocked);
+        assert!(text.contains(&format!("until {ready_at} (in ")), "{text}");
+        assert!(text.ends_with(" s)\n"), "{text}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        // Keep Tokio from auto-advancing the clock while the HTTP sockets are idle.
+        pause();
+        advance(Duration::from_secs(5)).await;
+        resume();
+        let resting = search_json(base, "second query").await;
+        assert_eq!(resting.engines, blocked.engines);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        pause();
+        advance(Duration::from_secs(15)).await;
+        resume();
+        let resumed = search_json(base, "rust async runtime").await;
+        assert_eq!(resumed.engines[0].state, EngineState::Ok);
+        assert!(resumed.engines[0].ready_at.is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -409,6 +477,13 @@ mod tests {
             assert_eq!(result["isError"], is_error, "engine state {state}");
             let text = result["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(expected_text), "{text}");
+            let engine = &result["structuredContent"]["engines"][0];
+            if state == "blocked" {
+                let ready_at = engine["ready_at"].as_str().expect("a rest deadline");
+                assert!(text.contains(&format!("{ready_at} (in 10 min)")), "{text}");
+            } else {
+                assert!(engine.get("ready_at").is_none());
+            }
             assert_eq!(engine_requests.load(Ordering::SeqCst), 1);
         }
     }

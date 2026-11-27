@@ -1,15 +1,27 @@
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use chrono::{SecondsFormat, Utc};
+use tokio::time::Instant;
+use url::Url;
 
 use crate::api::{EngineState, EngineStatus, ResultItem, SearchResponse};
 use crate::config::Config;
 use crate::engines::{Engine, Hit, Page};
+use crate::limits::{Admit, Limits};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Searcher {
     client: wreq::Client,
-    engines: Vec<&'static Engine>,
+    engines: Vec<EngineSlot>,
+}
+
+struct EngineSlot {
+    engine: &'static Engine,
+    base_url: Url,
+    limits: Mutex<Limits>,
 }
 
 struct Answer {
@@ -38,17 +50,50 @@ impl Answer {
 
 impl Searcher {
     pub fn new(config: &Config) -> wreq::Result<Self> {
-        Ok(Self {
-            client: http_client()?,
-            engines: config.engines.clone(),
-        })
+        Ok(Self::with_client(config, http_client()?))
+    }
+
+    fn with_client(config: &Config, client: wreq::Client) -> Self {
+        let engines = config
+            .engines
+            .iter()
+            .map(|engine| EngineSlot {
+                engine,
+                base_url: config
+                    .base_urls
+                    .get(engine.name)
+                    .cloned()
+                    .unwrap_or_else(|| Url::parse(engine.base_url).expect("engine base URL")),
+                limits: Mutex::new(Limits::new(config.rest)),
+            })
+            .collect();
+        Self { client, engines }
     }
 
     pub async fn search(&self, query: &str) -> SearchResponse {
         let mut results = Vec::new();
         let mut engines = Vec::with_capacity(self.engines.len());
-        for engine in &self.engines {
-            let answer = self.fetch(engine, query).await;
+        for slot in &self.engines {
+            let engine = slot.engine;
+            let admit = slot
+                .limits
+                .lock()
+                .expect("engine limits")
+                .admit(Instant::now(), Utc::now());
+            let (answer, ready_at) = match admit {
+                Admit::Resting(ready_at) => {
+                    (Answer::without_hits(EngineState::Blocked), Some(ready_at))
+                }
+                Admit::Send => {
+                    let answer = self.fetch(slot, query).await;
+                    let ready_at = slot.limits.lock().expect("engine limits").record(
+                        answer.state,
+                        Instant::now(),
+                        Utc::now(),
+                    );
+                    (answer, ready_at)
+                }
+            };
             if let Some(hits) = answer.hits {
                 for hit in hits {
                     let position = (results.len() + 1) as u32;
@@ -65,6 +110,7 @@ impl Searcher {
                 name: engine.name.to_string(),
                 state: answer.state,
                 error: answer.error,
+                ready_at: ready_at.map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true)),
             });
         }
         SearchResponse {
@@ -74,10 +120,10 @@ impl Searcher {
         }
     }
 
-    async fn fetch(&self, engine: &Engine, query: &str) -> Answer {
-        let base = url::Url::parse(engine.base_url).expect("engine base url");
-        let host = base.host_str().unwrap_or(engine.base_url).to_string();
-        let url = (engine.request_url)(&base, query);
+    async fn fetch(&self, slot: &EngineSlot, query: &str) -> Answer {
+        let engine = slot.engine;
+        let host = slot.base_url.host_str().unwrap_or(engine.base_url);
+        let url = (engine.request_url)(&slot.base_url, query);
         match self
             .client
             .get(url.as_str())
@@ -93,10 +139,10 @@ impl Searcher {
                 match response.text().await {
                     Ok(body) => answer_for_page(engine, status, &body),
                     Err(_) if status != 200 => Answer::error(format!("HTTP {status}")),
-                    Err(err) => Answer::error(fetch_error(&err, &host)),
+                    Err(err) => Answer::error(fetch_error(&err, host)),
                 }
             }
-            Err(err) => Answer::error(fetch_error(&err, &host)),
+            Err(err) => Answer::error(fetch_error(&err, host)),
         }
     }
 }
@@ -192,6 +238,16 @@ mod tests {
             .unwrap()
     }
 
+    fn test_searcher(client: wreq::Client, engines: Vec<&'static Engine>) -> Searcher {
+        Searcher::with_client(
+            &Config {
+                engines,
+                ..Config::default()
+            },
+            client,
+        )
+    }
+
     async fn serve(app: axum::Router) -> &'static str {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -265,10 +321,7 @@ mod tests {
                 read: read_body,
             }),
         ];
-        let searcher = Searcher {
-            client: test_client(),
-            engines,
-        };
+        let searcher = test_searcher(test_client(), engines);
         let response = searcher.search("rust async runtime").await;
         assert_eq!(response.query, "rust async runtime");
         assert_eq!(response.engines.len(), 2);
@@ -310,10 +363,7 @@ mod tests {
                 read: read_body,
             }),
         ];
-        let searcher = Searcher {
-            client: test_client(),
-            engines,
-        };
+        let searcher = test_searcher(test_client(), engines);
         let response = searcher.search("x").await;
         assert_eq!(response.engines[0].state, EngineState::Error);
         assert_eq!(response.engines[0].error.as_deref(), Some("HTTP 503"));
@@ -335,10 +385,7 @@ mod tests {
             request_url: empty_url,
             read: read_empty,
         })];
-        let searcher = Searcher {
-            client: test_client(),
-            engines,
-        };
+        let searcher = test_searcher(test_client(), engines);
         let response = searcher.search("x").await;
         assert!(response.results.is_empty());
         assert_eq!(response.engines[0].state, EngineState::Empty);
@@ -357,16 +404,16 @@ mod tests {
                 axum::routing::get(move || async move { (status, "first") }),
             );
             let base = serve(app).await;
-            let searcher = Searcher {
-                client: test_client(),
-                engines: vec![leaked(Engine {
+            let searcher = test_searcher(
+                test_client(),
+                vec![leaked(Engine {
                     name: "any",
                     base_url: base,
                     profile: wreq_util::Profile::Chrome149,
                     request_url: first_url,
                     read: read_body,
                 })],
-            };
+            );
             let response = searcher.search("x").await;
             assert_eq!(response.engines[0].state, EngineState::Blocked, "{status}");
             assert!(response.results.is_empty(), "{status}");
@@ -398,13 +445,13 @@ mod tests {
                 axum::routing::get(move || async move { (status, axum::response::Html(page)) }),
             );
             let base = serve(app).await;
-            let searcher = Searcher {
-                client: test_client(),
-                engines: vec![leaked(Engine {
+            let searcher = test_searcher(
+                test_client(),
+                vec![leaked(Engine {
                     base_url: base,
                     ..duckduckgo::ENGINE
                 })],
-            };
+            );
             let response = searcher.search("rust async runtime").await;
             assert_eq!(response.engines[0].name, "duckduckgo");
             assert_eq!(response.engines[0].state, state, "HTTP {status}");
@@ -428,16 +475,16 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap();
-        let searcher = Searcher {
+        let searcher = test_searcher(
             client,
-            engines: vec![leaked(Engine {
+            vec![leaked(Engine {
                 name: "slow",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
                 request_url: first_url,
                 read: read_body,
             })],
-        };
+        );
         let response = searcher.search("x").await;
         assert_eq!(response.engines[0].state, EngineState::Error);
         assert!(response.results.is_empty());
@@ -454,10 +501,7 @@ mod tests {
             .dns_resolver(FailResolve)
             .build()
             .unwrap();
-        let searcher = Searcher {
-            client,
-            engines: vec![&bing::ENGINE],
-        };
+        let searcher = test_searcher(client, vec![&bing::ENGINE]);
         let response = searcher.search("secret query").await;
         assert!(response.results.is_empty());
         assert_eq!(response.engines.len(), 1);
