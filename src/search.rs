@@ -54,7 +54,16 @@ impl Answer {
 
 impl Searcher {
     pub fn new(config: &Config) -> wreq::Result<Self> {
-        Ok(Self::with_client(config, http_client()?))
+        let builder = http_client_builder();
+        let builder = match &config.proxy {
+            Some(url) => {
+                let proxy = wreq::Proxy::all(url.as_str()).map_err(wreq::Error::without_uri)?;
+                builder.proxy(proxy)
+            }
+            None => builder.no_proxy(),
+        };
+        let client = builder.build().map_err(wreq::Error::without_uri)?;
+        Ok(Self::with_client(config, client))
     }
 
     fn with_client(config: &Config, client: wreq::Client) -> Self {
@@ -233,19 +242,16 @@ fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
     }
 }
 
-pub fn http_client() -> wreq::Result<wreq::Client> {
-    // wreq follows no redirects by default, and it reads the system proxy.
-    // scour has no proxy setting yet, and a Bing answer can be a redirect.
+pub fn http_client_builder() -> wreq::ClientBuilder {
+    // A Bing answer can be a redirect.
     wreq::Client::builder()
         .timeout(TIMEOUT)
         .redirect(wreq::redirect::Policy::limited(10))
-        .no_proxy()
         .dns_resolver(Ipv4Only)
-        .build()
 }
 
 fn fetch_error(err: &wreq::Error, host: &str) -> String {
-    // The wreq error text includes the request URL, and the URL includes the query.
+    // The wreq error can include the query or proxy details.
     if err.is_timeout() {
         format!("no answer from {host} in {} s", TIMEOUT.as_secs())
     } else {
@@ -253,7 +259,6 @@ fn fetch_error(err: &wreq::Error, host: &str) -> String {
     }
 }
 
-/// `local_address` binds only for an IPv4 target, so drop every IPv6 answer.
 struct Ipv4Only;
 
 impl wreq::dns::Resolve for Ipv4Only {
@@ -286,6 +291,135 @@ fn box_error(
 mod tests {
     use super::*;
     use crate::engines::{bing, duckduckgo};
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpSocket};
+    use tokio::time::timeout;
+
+    fn proxy_config(scheme: &str, address: SocketAddr, userinfo: &str) -> Config {
+        let path = std::env::temp_dir().join(format!(
+            "scour-proxy-{}-{}.toml",
+            std::process::id(),
+            address.port()
+        ));
+        std::fs::write(
+            &path,
+            format!("proxy = \"{scheme}://{userinfo}{address}\"\n"),
+        )
+        .unwrap();
+        let config = crate::config::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        config.unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_proxy_receives_connect_for_duckduckgo() {
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = proxy.local_addr().unwrap();
+        let config = proxy_config("http", address, "fixture-user:fixture-password@");
+        let searcher = Arc::new(Searcher::new(&config).unwrap());
+
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(searcher.search("offline"), async {
+                let (stream, _) = proxy.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                while !request.ends_with("\r\n\r\n") {
+                    assert_ne!(stream.read_line(&mut request).await.unwrap(), 0);
+                }
+                assert_eq!(
+                    request.lines().next(),
+                    Some("CONNECT html.duckduckgo.com:443 HTTP/1.1")
+                );
+                use base64::Engine as _;
+                let credentials = base64::engine::general_purpose::STANDARD
+                    .encode("fixture-user:fixture-password");
+                let auth = format!("Basic {credentials}");
+                assert!(request.lines().any(|line| {
+                    line.split_once(": ").is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("proxy-authorization") && value == auth
+                    })
+                }));
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            })
+        })
+        .await
+        .expect("HTTP proxy did not receive CONNECT");
+    }
+
+    #[tokio::test]
+    async fn socks5_resolves_ipv4_locally() {
+        check_socks_address("socks5", &[0x01, 127, 0, 0, 1]).await;
+    }
+
+    #[tokio::test]
+    async fn socks5h_sends_the_hostname_to_the_proxy() {
+        check_socks_address("socks5h", b"\x03\x09localhost").await;
+    }
+
+    async fn check_socks_address(scheme: &str, address: &[u8]) {
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let port = proxy_addr.port();
+        let mut config = proxy_config(scheme, proxy_addr, "");
+        config.base_urls.insert(
+            "duckduckgo",
+            Url::parse(&format!("http://localhost:{port}")).unwrap(),
+        );
+        let searcher = Arc::new(Searcher::new(&config).unwrap());
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(searcher.search("offline"), async {
+                let (mut stream, _) = proxy.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+
+                let mut request = vec![0; 3 + address.len() + 2];
+                stream.read_exact(&mut request[..4]).await.unwrap();
+                assert_eq!(&request[..4], &[5, 1, 0, address[0]]);
+                stream.read_exact(&mut request[4..]).await.unwrap();
+                assert_eq!(&request[3..3 + address.len()], address);
+                assert_eq!(&request[3 + address.len()..], &port.to_be_bytes());
+                stream
+                    .write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+            })
+        })
+        .await
+        .expect("SOCKS proxy did not receive the request");
+    }
+
+    #[tokio::test]
+    async fn unreachable_proxy_reports_error_without_direct_fallback() {
+        let proxy = TcpSocket::new_v4().unwrap();
+        proxy.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let mut config = proxy_config("http", proxy_addr, "fixture-user:fixture-password@");
+        config.base_urls.insert(
+            "duckduckgo",
+            Url::parse(&format!("http://{target_addr}")).unwrap(),
+        );
+        let searcher = Arc::new(Searcher::new(&config).unwrap());
+
+        let response = tokio::select! {
+            biased;
+            result = target.accept() => panic!("direct connection to the engine: {result:?}"),
+            response = searcher.search("offline") => response,
+        };
+        assert_eq!(response.engines[0].state, EngineState::Error);
+        assert_eq!(
+            response.engines[0].error.as_deref(),
+            Some("cannot connect to 127.0.0.1")
+        );
+    }
 
     /// DNS that fails before any connection, so the test makes no request.
     struct FailResolve;

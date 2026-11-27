@@ -162,7 +162,9 @@ struct ApiError {
 }
 
 async fn request_daemon<T: DeserializeOwned>(url: &Url, action: &str) -> Result<T, String> {
-    let client = crate::search::http_client()
+    let client = crate::search::http_client_builder()
+        .no_proxy()
+        .build()
         .map_err(|err| format!("scour: cannot start the client: {err}"))?;
     let fallback = || format!("scour: the {action} failed");
     let response = client

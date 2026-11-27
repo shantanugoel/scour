@@ -8,9 +8,9 @@ use url::Url;
 
 use crate::engines::{self, Engine, duckduckgo};
 
-#[derive(Debug)]
 pub struct Config {
     pub engines: Vec<&'static Engine>,
+    pub proxy: Option<Url>,
     pub base_urls: HashMap<&'static str, Url>,
     pub rest: Duration,
 }
@@ -19,6 +19,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             engines: vec![&duckduckgo::ENGINE],
+            proxy: None,
             base_urls: HashMap::new(),
             rest: Duration::from_secs(600),
         }
@@ -29,6 +30,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct File {
     engines: Option<Vec<String>>,
+    proxy: Option<String>,
     #[serde(default)]
     testing: Testing,
 }
@@ -85,6 +87,11 @@ fn parse(text: &str) -> Result<Config, String> {
     if let Some(names) = file.engines {
         config.engines = select_engines(names)?;
     }
+    if let Some(value) = file.proxy {
+        config.proxy = Some(parse_proxy(&value).ok_or_else(|| {
+            "proxy must be an http://, socks5://, or socks5h:// URL with a host".to_string()
+        })?);
+    }
     if let Some(seconds) = file.testing.rest_seconds {
         if seconds <= 0 {
             return Err("testing.rest_seconds must be greater than zero".to_string());
@@ -102,6 +109,25 @@ fn parse(text: &str) -> Result<Config, String> {
         config.base_urls.insert(engine.name, url);
     }
     Ok(config)
+}
+
+fn parse_proxy(value: &str) -> Option<Url> {
+    let (scheme, rest) = value.split_once("://")?;
+    // Url accepts HTTP URLs with extra slashes or backslashes before the host.
+    if rest.starts_with(['/', '\\']) || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    (scheme.eq_ignore_ascii_case(url.scheme())
+        && matches!(url.scheme(), "http" | "socks5" | "socks5h")
+        && url.has_host())
+    .then_some(url)
+}
+
+pub fn proxy_address(url: &Url) -> String {
+    let host = url.host_str().expect("validated proxy host");
+    let port = url.port_or_known_default().unwrap_or(1080);
+    format!("{}://{host}:{port}", url.scheme())
 }
 
 fn select_engines(names: Vec<String>) -> Result<Vec<&'static Engine>, String> {

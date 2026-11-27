@@ -53,8 +53,8 @@ async fn serve(config_path: Option<PathBuf>) -> ExitCode {
     };
     let searcher = match search::Searcher::new(&config) {
         Ok(searcher) => searcher,
-        Err(err) => {
-            eprintln!("scour: cannot start the client: {err}");
+        Err(_) => {
+            eprintln!("scour: cannot start the search client");
             return ExitCode::from(1);
         }
     };
@@ -65,7 +65,12 @@ async fn serve(config_path: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!("scour: listening on http://{}", api::ADDR);
+    let proxy = config
+        .proxy
+        .as_ref()
+        .map(|url| format!(" (proxy {})", config::proxy_address(url)))
+        .unwrap_or_default();
+    println!("scour: listening on http://{}{proxy}", api::ADDR);
     if let Err(err) = axum::serve(listener, api::router(Arc::new(searcher))).await {
         eprintln!("scour: the server stopped: {err}");
         return ExitCode::from(1);
