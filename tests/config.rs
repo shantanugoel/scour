@@ -12,8 +12,13 @@ fn config_file(name: &str, text: &str) -> PathBuf {
 }
 
 fn serve_with_config(path: &Path) -> Output {
+    serve_with_flags(path, &[])
+}
+
+fn serve_with_flags(path: &Path, flags: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_scour"))
         .arg("serve")
+        .args(flags)
         .arg("--config")
         .arg(path)
         .stdout(Stdio::piped())
@@ -248,10 +253,10 @@ fn per_engine_limit_overrides_exit_one() {
 
 #[test]
 fn unknown_engine_exits_one() {
-    let path = config_file("unknown-engine", "engines = [\"google\"]\n");
+    let path = config_file("unknown-engine", "engines = [\"yahoo\"]\n");
     let output = serve_with_config(&path);
     let _ = std::fs::remove_file(&path);
-    assert_exit_one(&output, "unknown engine `google`");
+    assert_exit_one(&output, "unknown engine `yahoo`");
 }
 
 #[test]
@@ -325,5 +330,25 @@ fn a_browser_engine_with_the_browser_off_exits_one_naming_the_item_and_the_flag(
     let _ = std::fs::remove_file(&path);
     let stderr = assert_exit_one(&output, "duckduckgo@browser");
     assert!(stderr.contains("--browser"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn google_with_the_browser_off_exits_one_naming_the_engine_and_the_flag() {
+    let path = config_file("google-engine", "engines = [\"duckduckgo\", \"google\"]\n");
+    let output = serve_with_config(&path);
+    let _ = std::fs::remove_file(&path);
+    let stderr = assert_exit_one(&output, "google");
+    assert!(stderr.contains("--browser"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn google_over_http_exits_one_with_the_browser_on() {
+    let path = config_file("google-http", "engines = [\"google@http\"]\n");
+    let output = serve_with_flags(&path, &["--browser"]);
+    let _ = std::fs::remove_file(&path);
+    let stderr = assert_exit_one(&output, "google@http");
+    assert!(!stderr.contains("unknown engine"), "{stderr}");
     assert!(output.stdout.is_empty());
 }

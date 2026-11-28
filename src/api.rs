@@ -34,6 +34,8 @@ pub struct ResultItem {
     pub url: String,
     pub title: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     pub engine: String,
     pub position: u32,
 }
@@ -195,6 +197,20 @@ mod tests {
         daily: 200,
     };
 
+    #[test]
+    fn a_result_without_a_domain_has_no_domain_key_in_json() {
+        let item = ResultItem {
+            url: "https://tokio.rs/".to_string(),
+            title: "Tokio".to_string(),
+            content: String::new(),
+            domain: None,
+            engine: "google".to_string(),
+            position: 1,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains(r#""domain""#), "{json}");
+    }
+
     async fn serve(app: axum::Router) -> (&'static str, SocketAddr) {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -242,6 +258,7 @@ mod tests {
             url: "https://tokio.rs/".to_string(),
             title: "Tokio".to_string(),
             content: body.to_string(),
+            domain: None,
         }])
     }
 
@@ -254,6 +271,7 @@ mod tests {
             name: "test",
             base_url: base,
             profile: wreq_util::Profile::Chrome149,
+            methods: &[Method::Http],
             request_url: engine_url,
             read: read_page,
         }));
@@ -577,6 +595,7 @@ bing = "{engine_base}"
                 url: "https://tokio.rs/".to_string(),
                 title: "Tokio".to_string(),
                 content: String::new(),
+                domain: None,
                 engine: "bing".to_string(),
                 position: 1,
             }]
@@ -1183,6 +1202,54 @@ bing = "{engine_base}"
         }
         assert_eq!(duckduckgo.load(Ordering::SeqCst), 0);
         assert_eq!(bing.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn google_over_http_is_a_bad_item_and_sends_no_engine_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { include_str!("../fixtures/google/web-results.html") }
+        });
+        let (engine_base, engine_address) = serve(app).await;
+        let name = format!(
+            "scour-google-http-{}-{}",
+            std::process::id(),
+            engine_address.port()
+        );
+        let path = std::env::temp_dir().join(format!("{name}.toml"));
+        std::fs::write(
+            &path,
+            format!(
+                "engines = [\"duckduckgo\", \"google\"]\n[testing.base_urls]\n\
+                 duckduckgo = \"{engine_base}\"\ngoogle = \"{engine_base}\"\n"
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(Some(&path), true);
+        std::fs::remove_file(path).unwrap();
+        // The browser starts on the first browser query, and this test sends none.
+        let browser = crate::browser::BrowserSettings {
+            cdp_port: 0,
+            root: std::env::temp_dir().join(name),
+        };
+        let searcher = Arc::new(Searcher::new(&config.unwrap(), Some(browser)).unwrap());
+        let (base, _) = serve(router(searcher)).await;
+
+        for list in ["google@http", "duckduckgo,google@http"] {
+            let (status, body) = search_with_engines(base, "rust", Some(list)).await;
+            assert_eq!(status, 400, "engines={list}");
+            let error = body["error"].as_str().expect("an error message");
+            assert!(error.contains("google@http"), "engines={list}: {error}");
+
+            let items: Vec<&str> = list.split(',').collect();
+            let called = mcp_search_with_engines(base, "rust", &items).await;
+            assert_eq!(called["isError"], true, "{items:?}: {called}");
+            let text = called["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("google@http"), "{items:?}: {text}");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

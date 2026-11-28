@@ -11,7 +11,7 @@ use crate::limits::LimitSettings;
 
 pub struct Config {
     pub engines: Vec<&'static Engine>,
-    /// The method of each engine, from a `name@method` item. A missing entry is `http`.
+    /// The default method of each enabled engine.
     pub methods: HashMap<&'static str, Method>,
     pub proxy: Option<Url>,
     pub base_urls: HashMap<&'static str, Url>,
@@ -204,10 +204,18 @@ fn select_engines(
         if selected.iter().any(|chosen| chosen.name == engine.name) {
             return Err(format!("engine `{item}` is listed more than once"));
         }
-        if let Some(method) = method {
-            method.check_available(&item, browser)?;
-            methods.insert(engine.name, method);
-        }
+        let method = match method {
+            Some(method) if !engine.methods.contains(&method) => {
+                return Err(format!(
+                    "engine `{item}` does not support the `{}` method",
+                    method.name()
+                ));
+            }
+            Some(method) => method,
+            None => engine.default_method(),
+        };
+        method.check_available(&item, browser)?;
+        methods.insert(engine.name, method);
         selected.push(engine);
     }
     Ok((selected, methods))

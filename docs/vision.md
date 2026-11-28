@@ -31,8 +31,8 @@ A scenario:
 5. The agent gets the results, and the state of each engine. If each engine rests, the agent gets no results, the
    state `blocked`, and the time when the engine is ready again.
 6. The owner starts the daemon with `--browser`. The daemon can then send an engine, such as DuckDuckGo, through
-   headful Chrome on a virtual display. Google through the browser is planned. The owner or the agent can also
-   send any enabled engine through Chrome.
+   headful Chrome on a virtual display. Google uses the browser. The owner or the agent can also send any
+   enabled engine through Chrome.
 7. Google shows a CAPTCHA. The daemon gives the calling agent a live link to that browser on `127.0.0.1`, and the
    agent passes it to a person.
 8. The person opens the link, through an SSH tunnel from another computer, and solves the CAPTCHA. The agent
@@ -49,7 +49,7 @@ A scenario:
 The first useful version lets a person or an agent do these things:
 
 - An agent can search the web through MCP over HTTP, and get results from DuckDuckGo, the default cheap HTTP
-  engine. A person can turn on Bing. Brave and Mojeek are planned as opt-in engines.
+  engine. A person can turn on Bing, and Google with the browser. Brave and Mojeek are planned as opt-in engines.
   scour merges the results when two or more engines answer.
 - An `engines` argument lets an agent select the engines for one query, and the method of each engine:
   HTTP or the browser (for example, `duckduckgo@browser`). The config sets the default method.
@@ -59,7 +59,7 @@ The first useful version lets a person or an agent do these things:
   When an engine rests, the agent gets `blocked` and the time when the engine is ready again.
 - The `--browser` flag starts the browser tier. A person can send any enabled engine through the browser.
   The tier uses headful Chrome on a virtual display (Xvfb). Chrome runs in a separate process.
-  Google through the browser is planned. A CDP URL from a person is planned.
+  Google uses the browser. A CDP URL from a person is planned.
 - The planned CAPTCHA handoff will let a person solve a CAPTCHA through a live link that the agent passes on.
   A person can open the link on the machine that runs scour, or from another computer through an SSH tunnel.
 
@@ -144,7 +144,6 @@ solver plugin.
 | How long does a solved session that gets one search each hour last after 8 hours? No CAPTCHA came in the 8 hours of #15. The result is from one IP and one day. | No spike is planned. Milestone 2 can measure it in use. | How often Google needs a person |
 | How often does a new headful Chrome session get a reCAPTCHA on its first Google query? 1 of 3 sessions did: 1 of 2 in the browser spike, and 0 of 1 in the Ardia spike (#32), which got results on 3 of 3 queries. | Milestone 2 | How often Google needs a person |
 | How long does Chrome take from its start to a ready CDP port? | Milestone 2 | The idle time before the daemon stops the browser |
-| How does the Google engine get the URL of each result? The saved page uses opaque `/goto?url=` tokens for result links. The `<cite>` text lacks a full URL. One request for each result would use the Google budget. | Milestone 2 plans a spike first if the live page DOM has no result URL. | The Google engine and step 2 of the milestone 2 demo |
 | How long does an unclicked Google `/sorry/` page stay solvable? Measured only: a clicked demo widget expired after approximately 2 minutes. | Milestone 2 | `expires_at` of a challenge |
 | Does headful Chrome clear a Cloudflare challenge each time, when scour waits until the challenge ends? In the browser spike it cleared one challenge on its second load. The test was not fair to the other browsers. | The plan of milestone 3, with a spike as its first slice | The milestone that fetches a page as Markdown |
 | Why do Bing results in headful Chrome change from one session to the next? Spike #31 got Turnstile and off-topic results; spike #32 got results on 6 of 6 queries. Do queries typed on the Bing home page work better? | No spike is planned. A later spike, if a person needs `bing@browser`. | Whether scour can promise `bing@browser` |

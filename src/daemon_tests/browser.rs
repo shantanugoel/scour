@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::http::{StatusCode, header};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -243,6 +243,73 @@ async fn chrome_start_failures_name_the_cause_and_release_resources() {
     daemon.stop(libc::SIGTERM).await;
 }
 
+#[tokio::test]
+async fn google_goes_through_the_browser_and_its_sorry_page_starts_a_rest() {
+    let _displays = DISPLAYS.lock().await;
+    let searches = Arc::new(AtomicUsize::new(0));
+    let count = searches.clone();
+    let engine = serve(
+        Router::new()
+            .route(
+                "/search",
+                get(move || {
+                    let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if first {
+                            Html(include_str!("../../fixtures/google/results.html")).into_response()
+                        } else {
+                            // Google sends a blocked search to its /sorry/ page.
+                            (
+                                StatusCode::FOUND,
+                                [(header::LOCATION, "/sorry/index?continue=REDACTED")],
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/sorry/index",
+                get(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Html(include_str!("../../fixtures/google/sorry.html")),
+                    )
+                }),
+            ),
+    )
+    .await;
+    let mut daemon = TestDaemon::start('g', "google", engine, 0, None).await;
+
+    let found = daemon.search(None).await;
+    assert_eq!(found.engines[0].name, "google", "{found:?}");
+    assert_eq!(found.engines[0].method, Method::Browser, "{found:?}");
+    assert_eq!(found.engines[0].state, EngineState::Ok, "{found:?}");
+    assert_eq!(found.results.len(), 8, "{found:?}");
+    assert!(found.results.iter().all(|result| result.engine == "google"));
+    assert_eq!(
+        found.results[0].url,
+        "https://www.youtube.com/watch?v=2Oo0615YhFg"
+    );
+    assert_eq!(
+        found.results[2].url,
+        "https://www.google.com/goto?url=REDACTED-3"
+    );
+    assert_eq!(found.results[2].domain.as_deref(), Some("www.facebook.com"));
+
+    let blocked = daemon.search(None).await;
+    assert_eq!(
+        blocked.engines[0].state,
+        EngineState::Blocked,
+        "{blocked:?}"
+    );
+    assert!(blocked.engines[0].ready_at.is_some(), "{blocked:?}");
+    assert!(blocked.results.is_empty(), "{blocked:?}");
+    assert_eq!(searches.load(Ordering::SeqCst), 2);
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
 struct TestDaemon {
     root: PathBuf,
     child: Child,
@@ -271,9 +338,10 @@ impl TestDaemon {
         let root = PathBuf::from(format!("/tmp/s{:x}{label}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("b")).unwrap();
+        let name = engine.split('@').next().unwrap();
         fs::write(
             root.join("config.toml"),
-            format!("engines = [\"{engine}\"]\n[testing.base_urls]\nduckduckgo = \"{base_url}\"\n"),
+            format!("engines = [\"{engine}\"]\n[testing.base_urls]\n{name} = \"{base_url}\"\n"),
         )
         .unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
