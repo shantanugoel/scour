@@ -101,9 +101,7 @@ fn parse(text: &str) -> Result<Config, String> {
         config.engines = select_engines(names)?;
     }
     if let Some(value) = file.proxy {
-        config.proxy = Some(parse_proxy(&value).ok_or_else(|| {
-            "proxy must be an http://, socks5://, or socks5h:// URL with a host".to_string()
-        })?);
+        config.proxy = Some(parse_proxy(&value).map_err(str::to_string)?);
     }
     if let Some(burst) = limit_value(
         file.limits.burst,
@@ -153,17 +151,31 @@ fn limit_value(value: Option<toml::Value>, max: u32, message: &str) -> Result<Op
     }
 }
 
-fn parse_proxy(value: &str) -> Option<Url> {
-    let (scheme, rest) = value.split_once("://")?;
+fn parse_proxy(value: &str) -> Result<Url, &'static str> {
+    const INVALID: &str = "proxy must be an http://, socks5://, or socks5h:// URL with a host; percent-encode special characters in the password";
+    const URL_PARTS: &str =
+        "a proxy URL has no path, query or fragment; percent-encode the password";
+
+    let (scheme, rest) = value.split_once("://").ok_or(INVALID)?;
     // Url accepts HTTP URLs with extra slashes or backslashes before the host.
     if rest.starts_with(['/', '\\']) || value.bytes().any(|byte| byte.is_ascii_control()) {
-        return None;
+        return Err(INVALID);
     }
-    let url = Url::parse(value).ok()?;
-    (scheme.eq_ignore_ascii_case(url.scheme())
+    let url = Url::parse(value).map_err(|_| INVALID)?;
+    if !(scheme.eq_ignore_ascii_case(url.scheme())
         && matches!(url.scheme(), "http" | "socks5" | "socks5h")
         && url.has_host())
-    .then_some(url)
+    {
+        return Err(INVALID);
+    }
+    // Url gives an HTTP URL without a path the path `/`, and a SOCKS URL no path.
+    if !(url.path().is_empty() || url.path() == "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(URL_PARTS);
+    }
+    Ok(url)
 }
 
 pub fn proxy_address(url: &Url) -> String {
@@ -235,5 +247,32 @@ mod tests {
     fn engines_key_enables_each_named_engine_in_order() {
         let config = load_text("two-engines", "engines = [\"duckduckgo\", \"bing\"]\n").unwrap();
         assert_eq!(names(&config), ["duckduckgo", "bing"]);
+    }
+
+    #[test]
+    fn proxy_with_an_encoded_password_or_a_bare_slash_loads_its_host() {
+        // Url gives an HTTP URL without a path the path `/`, so a bare `/` is not a path.
+        for (url, address) in [
+            (
+                "http://alice:12%23secret@proxy.example:8080",
+                "http://proxy.example:8080",
+            ),
+            (
+                "http://alice:12%3Fsecret@proxy.example:8080/",
+                "http://proxy.example:8080",
+            ),
+            (
+                "socks5://alice:12%2Fsecret@proxy.example:1080",
+                "socks5://proxy.example:1080",
+            ),
+            (
+                "socks5h://proxy.example:1080/",
+                "socks5h://proxy.example:1080",
+            ),
+        ] {
+            let config = load_text("valid-proxy", &format!("proxy = \"{url}\"\n")).unwrap();
+            let proxy = config.proxy.expect(url);
+            assert_eq!(proxy_address(&proxy), address, "{url}");
+        }
     }
 }

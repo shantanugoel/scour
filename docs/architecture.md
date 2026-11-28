@@ -153,7 +153,10 @@ flowchart LR
   The same exit code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing
   `--config` file. A TOML error shows a redacted parser message and the line number.
   The optional `proxy` key accepts an HTTP, SOCKS5, or SOCKS5H URL.
+  The URL has no path, query, or fragment, apart from a bare trailing `/`.
   An invalid proxy URL stops startup with exit code 1. The start line shows only the proxy scheme, host and port.
+  An unencoded `#`, `?`, or `/` in the password stops startup with a message to percent-encode the password.
+  That message omits the URL.
   Failed proxy connections return `error`. The engine client makes no direct fallback request.
   The optional `[limits]` table applies to all enabled engines. Each omitted key keeps its default.
 
