@@ -297,6 +297,9 @@ flowchart LR
   loses nothing that a client must renew. We did not use `legacy_session_mode`, because a session ID adds a
   handshake and a session table for a tool that holds no conversation state. If a client needs sessions, turn that
   mode on and record why.
+- **Two Docker images.** Users who do not need Google do not download a browser. We did not use one image, because
+  Chrome makes it several hundred MB larger: the installed Chromium is 437 MB. `scour:browser` has one browser,
+  not two.
 - **Docker packaging.** The plain image contains the HTTP engines. The browser image is planned.
   1. **Container IPv4 addresses.** A forwarder on `0.0.0.0:7268` conflicts with the daemon on `127.0.0.1:7268`.
      `socat` binds to the non-loopback IPv4 addresses from `hostname -i`. On a single bridge, `/proc/net/tcp` shows
@@ -311,8 +314,8 @@ flowchart LR
   4. **Zig.** BoringSSL (`btls-sys` 0.5.6) needs `cmake`, `git`, `libclang` and a C++ standard library.
      Debian's `musl-tools` supplies no musl C++ toolchain. The Alpine musl Rust image could not load `libclang`
      in spike #1. Zig supplies musl C and C++ toolchains and supports the planned arm64 cross-build.
-  5. **Static build check.** On `master` at `e5c35a6`, the Zig build took 1 min 16 s and produced a static
-     binary of 12,905,568 bytes. `scour serve --help` showed `--config` as the only daemon option.
+  5. **Static build check.** The Zig build produces a static binary of about 12.9 MB.
+     `scour serve --help` shows `--config` as the only daemon option.
   6. **Stage layout.** The `runtime` stage supplies the files and entrypoint used by the final `scour` stage.
      The planned `browser` target will also extend `runtime`, before the final `scour` stage. A build with
      `--target browser` will select the browser image. A default build produces the plain image.
