@@ -13,13 +13,14 @@ use crate::api::{
 };
 use crate::config::Config;
 use crate::engines::{Engine, Hit, Page};
-use crate::limits::{Admit, DAILY_LIMIT, Limits};
+use crate::limits::{Admit, Limits};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Searcher {
     client: wreq::Client,
     engines: Vec<EngineSlot>,
+    daily_limit: u32,
 }
 
 struct EngineSlot {
@@ -77,10 +78,14 @@ impl Searcher {
                     .get(engine.name)
                     .cloned()
                     .unwrap_or_else(|| Url::parse(engine.base_url).expect("engine base URL")),
-                limits: Mutex::new(Limits::new(config.rest)),
+                limits: Mutex::new(Limits::new(config.rest, config.limits)),
             })
             .collect();
-        Self { client, engines }
+        Self {
+            client,
+            engines,
+            daily_limit: config.limits.daily,
+        }
     }
 
     pub async fn search(self: &Arc<Self>, query: &str) -> SearchResponse {
@@ -100,7 +105,7 @@ impl Searcher {
                         .lock()
                         .expect("engine limits")
                         .daily_count(Instant::now()),
-                    daily_limit: DAILY_LIMIT,
+                    daily_limit: searcher.daily_limit,
                     error: answer.error,
                     ready_at: ready_at.map(format_deadline),
                 };
@@ -149,7 +154,7 @@ impl Searcher {
                     name: slot.engine.name.to_string(),
                     last_state: limits.last_state(),
                     daily_count: limits.daily_count(now),
-                    daily_limit: DAILY_LIMIT,
+                    daily_limit: self.daily_limit,
                     ready_at: limits.peek(now).map(format_deadline),
                 }
             })

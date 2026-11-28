@@ -7,14 +7,31 @@ use tokio::time::Instant;
 use crate::api::EngineState;
 
 const MAX_REST: Duration = Duration::from_secs(4 * 60 * 60);
-const PACE_INTERVAL: Duration = Duration::from_secs(30);
-const BURST: u32 = 5;
-const BURST_CREDIT: Duration = PACE_INTERVAL.saturating_mul(BURST - 1);
+// A 30 s pace wait plus the 10 s engine timeout fits within the 45 s CLI wait.
+const MAX_PACE_WAIT: Duration = Duration::from_secs(30);
 const DAILY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-pub const DAILY_LIMIT: u32 = 200;
+
+#[derive(Clone, Copy)]
+pub struct LimitSettings {
+    pub burst: u32,
+    pub refill: Duration,
+    pub daily: u32,
+}
+
+impl Default for LimitSettings {
+    fn default() -> Self {
+        Self {
+            burst: 3,
+            refill: Duration::from_secs(120),
+            daily: 100,
+        }
+    }
+}
 
 pub struct Limits {
     base_rest: Duration,
+    settings: LimitSettings,
+    burst_credit: Duration,
     consecutive_blocks: u32,
     rest: Option<(Instant, DateTime<Utc>)>,
     last_state: Option<EngineState>,
@@ -29,9 +46,11 @@ pub enum Admit {
 }
 
 impl Limits {
-    pub fn new(base_rest: Duration) -> Self {
+    pub fn new(base_rest: Duration, settings: LimitSettings) -> Self {
         Self {
             base_rest,
+            settings,
+            burst_credit: settings.refill * (settings.burst - 1),
             consecutive_blocks: 0,
             rest: None,
             last_state: None,
@@ -57,10 +76,10 @@ impl Limits {
         }
 
         // Represent the bucket as refill time owed. Burst credit lets requests consume it early.
-        let next = backlog + PACE_INTERVAL;
+        let next = backlog + self.settings.refill;
         self.pace_cursor = Some((now + next, wall + time_delta(next)));
         self.daily.push_back((now, wall));
-        Admit::SendAt(now + backlog.saturating_sub(BURST_CREDIT))
+        Admit::SendAt(now + backlog.saturating_sub(self.burst_credit))
     }
 
     pub fn confirm_send(
@@ -103,7 +122,7 @@ impl Limits {
     }
 
     fn daily_deadline(&self, now: Instant) -> Option<DateTime<Utc>> {
-        if self.daily.len() < DAILY_LIMIT as usize {
+        if self.daily.len() < self.settings.daily as usize {
             return None;
         }
         let &(at, wall) = self.daily.front()?;
@@ -117,7 +136,9 @@ impl Limits {
 
     fn pace_deadline(&self, backlog: Duration) -> Option<DateTime<Utc>> {
         let (_, wall) = self.pace_cursor?;
-        (backlog > BURST_CREDIT + PACE_INTERVAL).then(|| wall - time_delta(BURST_CREDIT))
+        let wait = backlog.saturating_sub(self.burst_credit);
+        (wait > self.settings.refill.min(MAX_PACE_WAIT))
+            .then(|| wall - time_delta(self.burst_credit))
     }
 
     pub fn record(
@@ -158,10 +179,16 @@ mod tests {
     use super::*;
     use tokio::time::{advance, pause};
 
+    const SHORT_REFILL: LimitSettings = LimitSettings {
+        burst: 5,
+        refill: Duration::from_secs(30),
+        daily: 200,
+    };
+
     #[tokio::test]
     async fn only_one_caller_can_reserve_the_next_pace_slot() {
         pause();
-        let mut limits = Limits::new(Duration::from_secs(600));
+        let mut limits = Limits::new(Duration::from_secs(600), SHORT_REFILL);
         let now = Instant::now();
         let wall = DateTime::from_timestamp(1_800_000_000, 999_500_000).unwrap();
         for _ in 0..5 {
@@ -187,10 +214,38 @@ mod tests {
         assert_eq!(limits.confirm_send(Instant::now(), (now, wall)), None);
     }
 
+    #[test]
+    fn pace_wait_is_capped_at_thirty_seconds_with_a_longer_refill() {
+        let settings = LimitSettings {
+            burst: 1,
+            refill: Duration::from_secs(60),
+            ..LimitSettings::default()
+        };
+        let mut limits = Limits::new(Duration::from_secs(600), settings);
+        let now = Instant::now();
+        let wall = Utc::now();
+        let ready_at = wall + TimeDelta::seconds(60);
+        assert!(matches!(limits.admit(now, wall), Admit::SendAt(at) if at == now));
+
+        let before = now + Duration::from_secs(29);
+        assert_eq!(limits.peek(before), Some(ready_at));
+        assert!(matches!(
+            limits.admit(before, wall + TimeDelta::seconds(29)),
+            Admit::Limited(at) if at == ready_at
+        ));
+
+        let boundary = now + Duration::from_secs(30);
+        assert_eq!(limits.peek(boundary), None);
+        assert!(matches!(
+            limits.admit(boundary, wall + TimeDelta::seconds(30)),
+            Admit::SendAt(at) if at == now + Duration::from_secs(60)
+        ));
+    }
+
     #[tokio::test]
     async fn rolling_daily_limit_expires_from_the_oldest_request() {
         pause();
-        let mut limits = Limits::new(Duration::from_secs(600));
+        let mut limits = Limits::new(Duration::from_secs(600), SHORT_REFILL);
         let start = Instant::now();
         let wall = Utc::now();
         for count in 0..200 {
@@ -226,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn refund_removes_the_delayed_reservation_even_after_a_newer_admission() {
         pause();
-        let mut limits = Limits::new(Duration::from_secs(600));
+        let mut limits = Limits::new(Duration::from_secs(600), SHORT_REFILL);
         let now = Instant::now();
         let wall = Utc::now();
         for _ in 0..5 {
@@ -255,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn consecutive_blocks_double_rest_up_to_four_hours() {
         pause();
-        let mut limits = Limits::new(Duration::from_secs(3600));
+        let mut limits = Limits::new(Duration::from_secs(3600), LimitSettings::default());
         let mut wall = Utc::now();
         for hours in [1, 2, 4, 4] {
             let rest = Duration::from_secs(hours * 3600);
@@ -282,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn ok_clears_rest_and_resets_the_block_count() {
         pause();
-        let mut limits = Limits::new(Duration::from_secs(10));
+        let mut limits = Limits::new(Duration::from_secs(10), LimitSettings::default());
         let wall = Utc::now();
         limits.record(EngineState::Blocked, Instant::now(), wall);
         advance(Duration::from_secs(10)).await;
@@ -308,7 +363,7 @@ mod tests {
             EngineState::ParseFailed,
             EngineState::Error,
         ] {
-            let mut limits = Limits::new(Duration::from_secs(10));
+            let mut limits = Limits::new(Duration::from_secs(10), LimitSettings::default());
             let wall = Utc::now();
             let first_deadline = wall + TimeDelta::seconds(10);
             limits.record(EngineState::Blocked, Instant::now(), wall);

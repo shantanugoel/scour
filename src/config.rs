@@ -7,12 +7,14 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::engines::{self, Engine, duckduckgo};
+use crate::limits::LimitSettings;
 
 pub struct Config {
     pub engines: Vec<&'static Engine>,
     pub proxy: Option<Url>,
     pub base_urls: HashMap<&'static str, Url>,
     pub rest: Duration,
+    pub limits: LimitSettings,
 }
 
 impl Default for Config {
@@ -22,6 +24,7 @@ impl Default for Config {
             proxy: None,
             base_urls: HashMap::new(),
             rest: Duration::from_secs(600),
+            limits: LimitSettings::default(),
         }
     }
 }
@@ -32,7 +35,17 @@ struct File {
     engines: Option<Vec<String>>,
     proxy: Option<String>,
     #[serde(default)]
+    limits: LimitsFile,
+    #[serde(default)]
     testing: Testing,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    burst: Option<toml::Value>,
+    refill_seconds: Option<toml::Value>,
+    daily: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -92,6 +105,27 @@ fn parse(text: &str) -> Result<Config, String> {
             "proxy must be an http://, socks5://, or socks5h:// URL with a host".to_string()
         })?);
     }
+    if let Some(burst) = limit_value(
+        file.limits.burst,
+        1000,
+        "limits.burst must be a whole number from 1 to 1000",
+    )? {
+        config.limits.burst = burst;
+    }
+    if let Some(seconds) = limit_value(
+        file.limits.refill_seconds,
+        86400,
+        "limits.refill_seconds must be a whole number of seconds from 1 to 86400",
+    )? {
+        config.limits.refill = Duration::from_secs(u64::from(seconds));
+    }
+    if let Some(daily) = limit_value(
+        file.limits.daily,
+        u32::MAX,
+        "limits.daily must be a whole number from 1 to 4294967295",
+    )? {
+        config.limits.daily = daily;
+    }
     if let Some(seconds) = file.testing.rest_seconds {
         if seconds <= 0 {
             return Err("testing.rest_seconds must be greater than zero".to_string());
@@ -109,6 +143,14 @@ fn parse(text: &str) -> Result<Config, String> {
         config.base_urls.insert(engine.name, url);
     }
     Ok(config)
+}
+
+fn limit_value(value: Option<toml::Value>, max: u32, message: &str) -> Result<Option<u32>, String> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Integer(n)) if (1..=i64::from(max)).contains(&n) => Ok(Some(n as u32)),
+        Some(_) => Err(message.to_string()),
+    }
 }
 
 fn parse_proxy(value: &str) -> Option<Url> {

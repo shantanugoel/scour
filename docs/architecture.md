@@ -92,16 +92,21 @@ flowchart LR
   The CLI waits up to 45 seconds for a response from the daemon.
   Planned: a browser query has its own timeout, which includes the wait for a free tab. A measurement in
   Milestone 2 sets the value. A timeout gives `error`.
-- **Pace and daily limits.** Admission checks active rest first, then the 200-request rolling limit, then pace.
-  Each engine starts with five tokens and refills one every 30 seconds, up to five.
-  If the next token is more than 30 seconds away, the engine reports `limited` with the time it can next send.
+- **Pace and daily limits.** Admission checks active rest first, then the rolling daily limit, then pace.
+  By default, each engine starts with three tokens and refills one every 120 seconds, up to three.
+  Each engine defaults to 100 requests per 24 hours. The `[limits]` keys `burst`, `refill_seconds` and `daily`
+  set the same values for every enabled engine. Duration keys use positive whole numbers and end in their unit.
+  If the next token is more than 30 seconds or one refill interval away, the engine reports `limited` with `ready_at`.
+  The 30-second cap and the 10-second engine timeout fit within the CLI's 45-second wait.
   Otherwise, admission reserves the token and adds the request to the daily count. It releases the lock before any wait.
   If rest begins during the wait, the daemon cancels the send and refunds its daily reservation.
   Failed sends count. At the daily limit, `ready_at` is the oldest request's admission time plus 24 hours.
+  After a paced run of 60 queries, DuckDuckGo blocked the test IP for more than 12 hours.
+  The research estimate was 50 to 100 queries per day from one IP. [Spike #14](https://github.com/shantanugoel/scour/issues/14) and [follow-up #35](https://github.com/shantanugoel/scour/issues/35).
   Planned: `http` and `browser` requests of one engine use the same tokens and the same daily count.
 - **Status.** `GET /status` returns `engines[]` in config order, with `name`, `last_state`, `daily_count` and `daily_limit`.
   `last_state` starts as `null` and tracks search outcomes, including requests skipped during rest or at a limit.
-  `ready_at` appears only during active rest, at the daily limit, or when the next pace slot is more than 30 seconds away.
+  `ready_at` appears during active rest, at the daily limit, or if a pace wait exceeds 30 seconds or one refill interval.
   `scour status` prints this snapshot, which sends no engine requests.
   Planned: the snapshot keeps one row for each engine and no method, because both methods share one state.
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
@@ -150,6 +155,18 @@ flowchart LR
   The optional `proxy` key accepts an HTTP, SOCKS5, or SOCKS5H URL.
   An invalid proxy URL stops startup with exit code 1. The start line shows only the proxy scheme, host and port.
   Failed proxy connections return `error`. The engine client makes no direct fallback request.
+  The optional `[limits]` table applies to all enabled engines. Each omitted key keeps its default.
+
+  ```toml
+  [limits]
+  burst = 3
+  refill_seconds = 120
+  daily = 100
+  ```
+
+  The inclusive ranges are 1 to 1000 for `burst`, 1 to 86400 for `refill_seconds`, and 1 to 4294967295 for `daily`.
+  An invalid value stops startup with exit code 1 and a message that names the key and omits the value.
+  Unknown keys and engine subtables also stop startup with exit code 1.
   For local tests, `[testing].rest_seconds` sets a positive base duration.
   `[testing.base_urls]` maps enabled engine names to HTTP or HTTPS URLs. Unknown and disabled engine keys fail at startup.
   The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag

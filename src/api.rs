@@ -172,8 +172,14 @@ mod tests {
 
     use crate::config::Config;
     use crate::engines::{Engine, Hit, Page, bing, duckduckgo};
+    use crate::limits::LimitSettings;
 
     const ACCEPT: &str = "application/json, text/event-stream";
+    const SHORT_REFILL: LimitSettings = LimitSettings {
+        burst: 5,
+        refill: Duration::from_secs(30),
+        daily: 200,
+    };
 
     async fn serve(app: axum::Router) -> (&'static str, SocketAddr) {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -226,6 +232,10 @@ mod tests {
     }
 
     fn searcher(base: &'static str) -> Arc<Searcher> {
+        searcher_with_limits(base, LimitSettings::default())
+    }
+
+    fn searcher_with_limits(base: &'static str, limits: LimitSettings) -> Arc<Searcher> {
         let engine = Box::leak(Box::new(Engine {
             name: "test",
             base_url: base,
@@ -236,13 +246,16 @@ mod tests {
         Arc::new(
             Searcher::new(&Config {
                 engines: vec![engine],
+                limits,
                 ..Config::default()
             })
             .expect("client"),
         )
     }
 
-    async fn blocked_duckduckgo_with_bing() -> (Arc<Searcher>, Arc<AtomicUsize>) {
+    async fn blocked_duckduckgo_with_bing(
+        limits: LimitSettings,
+    ) -> (Arc<Searcher>, Arc<AtomicUsize>) {
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = requests.clone();
         let app = axum::Router::new()
@@ -265,6 +278,7 @@ mod tests {
         let config = Config {
             engines: vec![&duckduckgo::ENGINE, &bing::ENGINE],
             base_urls: [("duckduckgo", base.clone()), ("bing", base)].into(),
+            limits,
             ..Config::default()
         };
         (Arc::new(Searcher::new(&config).unwrap()), requests)
@@ -346,6 +360,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_pace_rejects_the_fourth_search_without_sending() {
+        let (engine_base, requests) = engine(StatusCode::OK, "Tokio").await;
+        let searcher = searcher(engine_base);
+        let before = Utc::now();
+        for count in 1..=3 {
+            let response = searcher.search("burst").await;
+            assert_eq!(response.engines[0].state, EngineState::Ok);
+            assert_eq!(requests.load(Ordering::SeqCst), count);
+        }
+        let after = Utc::now();
+
+        pause();
+        let health = searcher.status();
+        let response = timeout(Duration::from_secs(1), searcher.search("too soon"))
+            .await
+            .expect("a limited query should return without waiting for a token");
+        let engine = &response.engines[0];
+        assert_eq!(engine.state, EngineState::Limited);
+        assert_eq!(engine.daily_count, 3);
+        assert_eq!(engine.ready_at, health.engines[0].ready_at);
+        let deadline = DateTime::parse_from_rfc3339(engine.ready_at.as_deref().unwrap()).unwrap();
+        assert!(deadline > before + TimeDelta::seconds(119));
+        assert!(deadline <= after + TimeDelta::seconds(120));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn configured_limits_apply_to_each_enabled_engine() {
+        let app = axum::Router::new()
+            .route(
+                "/html/",
+                axum::routing::get(|| async {
+                    include_str!("../fixtures/duckduckgo/results.html")
+                }),
+            )
+            .route(
+                "/search",
+                axum::routing::get(|| async { include_str!("../fixtures/bing/results.html") }),
+            );
+        let (engine_base, _) = serve(app).await;
+        let path = std::env::temp_dir().join(format!("scour-limits-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                r#"engines = ["duckduckgo", "bing"]
+[limits]
+burst = 1
+refill_seconds = 60
+daily = 2
+[testing.base_urls]
+duckduckgo = "{engine_base}"
+bing = "{engine_base}"
+"#
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        let searcher = Arc::new(Searcher::new(&config.unwrap()).unwrap());
+        let (base, address) = serve(router(searcher)).await;
+
+        assert_eq!(
+            status_json(address).await,
+            serde_json::json!({"engines": [
+                {"name": "duckduckgo", "last_state": null, "daily_count": 0, "daily_limit": 2},
+                {"name": "bing", "last_state": null, "daily_count": 0, "daily_limit": 2}
+            ]})
+        );
+        for (state, count) in [(EngineState::Ok, 1), (EngineState::Limited, 1)] {
+            let response = search_json(base, "burst").await;
+            for engine in response.engines {
+                assert_eq!(engine.state, state, "{}", engine.name);
+                assert_eq!(engine.daily_count, count);
+                assert_eq!(engine.daily_limit, 2);
+            }
+        }
+
+        pause();
+        advance(Duration::from_secs(60)).await;
+        resume();
+        for engine in search_json(base, "refilled").await.engines {
+            assert_eq!(engine.state, EngineState::Ok, "{}", engine.name);
+            assert_eq!(engine.daily_count, 2);
+        }
+
+        let now = Utc::now();
+        for engine in search_json(base, "daily limit").await.engines {
+            assert_eq!(engine.state, EngineState::Limited, "{}", engine.name);
+            assert_eq!(engine.daily_count, 2);
+            let deadline =
+                DateTime::parse_from_rfc3339(engine.ready_at.as_deref().unwrap()).unwrap();
+            assert!(deadline > now + TimeDelta::hours(23));
+        }
+    }
+
+    #[tokio::test]
     async fn configured_engine_skips_requests_until_its_block_rest_expires() {
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = requests.clone();
@@ -377,7 +487,7 @@ mod tests {
         assert_eq!(
             status_json(address).await,
             serde_json::json!({"engines": [{
-                "name": "duckduckgo", "last_state": null, "daily_count": 0, "daily_limit": 200
+                "name": "duckduckgo", "last_state": null, "daily_count": 0, "daily_limit": 100
             }]})
         );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -387,7 +497,7 @@ mod tests {
         let after = Utc::now();
         assert_eq!(blocked.engines[0].state, EngineState::Blocked);
         assert_eq!(blocked.engines[0].daily_count, 1);
-        assert_eq!(blocked.engines[0].daily_limit, 200);
+        assert_eq!(blocked.engines[0].daily_limit, 100);
         let ready_at = blocked.engines[0].ready_at.as_deref().unwrap();
         let deadline = DateTime::parse_from_rfc3339(ready_at).unwrap().to_utc();
         assert_eq!(
@@ -411,7 +521,7 @@ mod tests {
             status_json(address).await["engines"][0],
             serde_json::json!({
                 "name": "duckduckgo", "last_state": "blocked", "ready_at": ready_at,
-                "daily_count": 1, "daily_limit": 200
+                "daily_count": 1, "daily_limit": 100
             })
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -432,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_blocked_engine_leaves_the_other_engines_results_available() {
-        let (searcher, requests) = blocked_duckduckgo_with_bing().await;
+        let (searcher, requests) = blocked_duckduckgo_with_bing(LimitSettings::default()).await;
         let (base, _) = serve(router(searcher)).await;
         let mut response = search_json(base, "rust").await;
         let [duckduckgo, bing] = response.engines.as_mut_slice() else {
@@ -467,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_resting_engines_report_their_deadlines_and_no_answer() {
-        let (searcher, requests) = blocked_duckduckgo_with_bing().await;
+        let (searcher, requests) = blocked_duckduckgo_with_bing(SHORT_REFILL).await;
         let (base, address) = serve(router(searcher.clone())).await;
         for count in 1..=5 {
             let response = search_json(base, "burst").await;
@@ -564,7 +674,7 @@ mod tests {
             }),
         );
         let (engine_base, _) = serve(app).await;
-        let searcher = searcher(engine_base);
+        let searcher = searcher_with_limits(engine_base, SHORT_REFILL);
         let blocking = tokio::spawn({
             let searcher = searcher.clone();
             async move { searcher.search("block").await }
@@ -750,7 +860,7 @@ mod tests {
             assert!(text.contains(expected_text), "{text}");
             let engine = &result["structuredContent"]["engines"][0];
             assert_eq!(engine["daily_count"], 1);
-            assert_eq!(engine["daily_limit"], 200);
+            assert_eq!(engine["daily_limit"], 100);
             if state == "blocked" {
                 let ready_at = engine["ready_at"].as_str().expect("a rest deadline");
                 assert!(text.contains(&format!("{ready_at} (in 10 min)")), "{text}");
@@ -831,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_host_on_any_port_and_no_origin_or_a_local_origin_pass() {
         let (engine_base, engine_requests) = engine(StatusCode::OK, "Tokio").await;
-        let (_, address) = serve(router(searcher(engine_base))).await;
+        let (_, address) = serve(router(searcher_with_limits(engine_base, SHORT_REFILL))).await;
         let local = format!("127.0.0.1:{}", address.port());
         let local_name = format!("localhost:{}", address.port());
         let local_origin = format!("http://{local}");
