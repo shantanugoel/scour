@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use super::{Engine, Hit, Page, accepted_result, is_host, plain_text, selector};
+use super::{Engine, Hit, Method, Page, accepted_result, is_host, plain_text, selector};
 
 const SITE: &str = "bing.com";
 
@@ -9,6 +9,7 @@ pub const ENGINE: Engine = Engine {
     name: "bing",
     base_url: "https://www.bing.com",
     profile: wreq_util::Profile::Chrome149,
+    methods: &[Method::Http, Method::Browser],
     request_url,
     read,
 };
@@ -61,6 +62,7 @@ fn parse(html: &str) -> Vec<Hit> {
             url,
             title,
             content,
+            domain: None,
         });
     }
     hits

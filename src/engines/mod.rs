@@ -56,6 +56,7 @@ pub struct Hit {
     pub url: String,
     pub title: String,
     pub content: String,
+    pub domain: Option<String>,
 }
 
 /// One cheap engine. The URL builder and the page reader are pure functions.
@@ -64,6 +65,8 @@ pub struct Engine {
     pub name: &'static str,
     pub base_url: &'static str,
     pub profile: wreq_util::Profile,
+    /// The methods the engine supports; the first is the default.
+    pub methods: &'static [Method],
     pub request_url: fn(base: &url::Url, query: &str) -> url::Url,
     pub read: fn(status: u16, body: &str) -> Page,
 }
@@ -77,7 +80,7 @@ pub enum Page {
 }
 
 /// Every known engine. The default config enables only DuckDuckGo.
-pub const ALL: &[Engine] = &[duckduckgo::ENGINE, bing::ENGINE];
+pub const ALL: &[Engine] = &[duckduckgo::ENGINE, bing::ENGINE, google::ENGINE];
 
 pub fn find(name: &str) -> Option<&'static Engine> {
     ALL.iter().find(|engine| engine.name == name)

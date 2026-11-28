@@ -152,6 +152,12 @@ impl Searcher {
                 return Err(format!("engine `{item}` is listed more than once"));
             }
             let method = method.unwrap_or(self.engines[index].method);
+            if !self.engines[index].engine.methods.contains(&method) {
+                return Err(format!(
+                    "engine `{item}` does not support the `{}` method",
+                    method.name()
+                ));
+            }
             method.check_available(item, self.browser.is_some())?;
             selected.push((index, method));
         }
@@ -201,6 +207,7 @@ impl Searcher {
                         url: hit.url,
                         title: hit.title,
                         content: hit.content,
+                        domain: hit.domain,
                         engine: engine.name.clone(),
                         position: (results.len() + 1) as u32,
                     });
@@ -590,6 +597,7 @@ mod tests {
             url: format!("https://{}.example/", body.trim()),
             title: body.trim().to_string(),
             content: String::new(),
+            domain: None,
         }])
     }
 
@@ -627,6 +635,7 @@ mod tests {
                 name: "first",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
+                methods: &[Method::Http],
                 request_url: first_url,
                 read: read_body,
             }),
@@ -634,6 +643,7 @@ mod tests {
                 name: "second",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
+                methods: &[Method::Http],
                 request_url: second_url,
                 read: read_body,
             }),
@@ -745,6 +755,7 @@ mod tests {
                 name: "failing",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
+                methods: &[Method::Http],
                 request_url: fail_url,
                 read: read_body,
             }),
@@ -752,6 +763,7 @@ mod tests {
                 name: "working",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
+                methods: &[Method::Http],
                 request_url: second_url,
                 read: read_body,
             }),
@@ -775,6 +787,7 @@ mod tests {
             name: "empty",
             base_url: base,
             profile: wreq_util::Profile::Chrome149,
+            methods: &[Method::Http],
             request_url: empty_url,
             read: read_empty,
         })];
@@ -803,6 +816,7 @@ mod tests {
                     name: "any",
                     base_url: base,
                     profile: wreq_util::Profile::Chrome149,
+                    methods: &[Method::Http],
                     request_url: first_url,
                     read: read_body,
                 })],
@@ -874,6 +888,7 @@ mod tests {
                 name: "slow",
                 base_url: base,
                 profile: wreq_util::Profile::Chrome149,
+                methods: &[Method::Http],
                 request_url: first_url,
                 read: read_body,
             })],

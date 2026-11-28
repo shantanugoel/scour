@@ -1,15 +1,15 @@
 # Architecture
 
 scour is one Rust binary. It runs as one local daemon (`scour serve`), and the agents on the machine use it.
-The daemon asks DuckDuckGo by default and Bing only if a person turns it on. It uses an HTTP client that has
-a browser TLS fingerprint. It listens only on `127.0.0.1:7268`. No flag, variable or file changes that address.
+The daemon asks DuckDuckGo by default. A person can turn on Bing, and Google with `--browser`. It uses an HTTP
+client that has a browser TLS fingerprint. It listens only on `127.0.0.1:7268`. No flag, variable or file changes that address.
 An agent searches through MCP over streamable HTTP at `/mcp`.
 With `--browser`, the daemon runs headful Chrome on Xvfb, a virtual display.
 The daemon drives Chrome through CDP (the Chrome DevTools Protocol) with `chromiumoxide`.
 
 The main reason for this shape: blocks come mostly from the IP and from the fingerprint, not from the tool. Thus
 most queries use the cheap tier. The release binary is 17657880 bytes. The idle daemon uses 11.0 MiB of memory.
-The browser tier runs queries for engines set to `browser` in the config or query. Google support is planned.
+The browser tier runs queries for engines set to `browser` in the config or query. Google uses the browser tier.
 
 ## Context
 
@@ -24,7 +24,7 @@ flowchart LR
   p --> bing
   d -. planned, opt-in .-> eng[Brave, Mojeek]
   d -. CDP, opt-in .-> br[Headful Chrome on Xvfb]
-  br -. planned .-> g[Google]
+  br -- browser method --> g[Google]
   br -. browser method .-> bing
   br -. browser method .-> ddg
   d -. challenge, planned .-> sol[Person through the local inspector link, or solver plugin]
@@ -39,12 +39,12 @@ flowchart LR
 | JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. `GET /search` accepts the same `engines` list as MCP, and `scour search --engines duckduckgo,bing@http "q"` sends it. | `axum`, `wreq` | built |
 | Parallel search | Starts one task per selected engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
 | Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. It checks the whole list before it sends any engine request. The cascade sends `browser` engines through the browser tier when `--browser` is set. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | built |
-| Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned as a browser-only engine. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. Both methods use the same `request_url` and `read`. The browser method reads the DOM after the page loads. Planned: `profile` becomes optional for browser-only engines, and `read` can give `Page::Challenge(kind)`. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo and Bing |
-| HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
+| Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, supported methods, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is built as a browser-only engine. It uses `https://www.google.com/search?q=<q>&hl=en&pws=0`. A web result URL is the absolute Google `/goto?url=` redirect. Spike #37 found no free source for the target URL, so owner decision B keeps the redirect. A `/url?q=<target>` link uses the plain target, because it costs no extra request. A video card uses its exact `data-curl` URL. Each result has a `domain` from the host in `<cite>`, and the field is absent when `<cite>` shows only a date or a count. The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`. Both methods use the same `request_url` and `read`. The browser method reads the DOM after the page loads. Planned: `profile` becomes optional for browser-only engines, and `read` can give `Page::Challenge(kind)`. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo, Bing and Google |
+| HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. Google has no HTTP method. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Starts one Chrome on Xvfb on the first browser query. `fetch(url)` opens a tab in one shared query context, reads the main document status and rendered HTML, then closes the tab. The CDP port is fixed at `127.0.0.1:7269`. See "Browser lifecycle" below. | `chromiumoxide` 0.9 | built |
-| Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Both methods of an engine share this state. | Rust, in memory | built for DuckDuckGo and Bing |
+| Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Both methods of an engine share this state. | Rust, in memory | built for DuckDuckGo, Bing and Google |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
-| Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike, a Google result page from more than 3 hours after a solve (`.evidence/15/fixture-result-after-3h.html`, 8 results in `#rso`, with `/goto?url=` result links and the target domain in `<cite>`), and the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo and Bing |
+| Fixtures and canary | Saved DuckDuckGo, Bing and Google pages test the parsers. The Google fixtures are `fixtures/google/results.html` (the #15 page from more than 3 hours after a solve, 8 results), `web-results.html` (the #37 page, 10 results) and `sorry.html`. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo, Bing and Google |
 | Packaging | The `scour` image runs the HTTP engines and is about 138 MB on x86_64 and 159 MB on arm64. The planned `scour:browser` image adds Chromium and Xvfb. The installed Chromium of the browser spike is 437 MB. On Linux, install Chrome or Chromium and Xvfb. scour runs `Xvfb` from `PATH`. For Chrome, it checks `CHROME`, then `chrome`, `chrome-browser`, `google-chrome-stable`, `chromium` and `chromium-browser` on `PATH`, in order. | Docker, static musl binary | `scour` built for x86_64 and arm64, `scour:browser` planned |
 
 ## Browser lifecycle
@@ -66,8 +66,9 @@ flowchart LR
 ## Data
 
 - **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
-  `content`, `engine` and `position`, and `engines[]` with `name`, `method`, `state`, `daily_count` and
-  `daily_limit`.
+  `content`, an optional `domain`, `engine` and `position`, and `engines[]` with `name`, `method`, `state`,
+  `daily_count` and `daily_limit`. A Google result has `domain` when `<cite>` shows a host; the field is absent
+  otherwise.
   The merge takes one item per engine in config order for each rank. It keeps the first occurrence of each exact
   URL string, including that item's engine, and assigns consecutive positions starting at 1.
   The `engines[]` array stays in config order even when engine tasks finish out of order.
@@ -162,11 +163,12 @@ flowchart LR
     `search` again, and the browser session gives results.
 - **Configuration.** One TOML file holds the enabled engines. The default path is `$XDG_CONFIG_HOME/scour/config.toml`,
   or `$HOME/.config/scour/config.toml`. The `engines` key is a list; it defaults to `["duckduckgo"]`, and a person
-  can add `bing`. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
-  An item is `<name>` or `<name>@<method>`, as in `["duckduckgo", "bing@http"]`. A bare name uses `http`.
+  can add `bing`, and `google` with the browser. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
+  An item is `<name>` or `<name>@<method>`, as in `["duckduckgo", "bing@http"]`. A bare name uses the engine
+  default: `http` for DuckDuckGo and Bing, and `browser` for Google.
   An unknown engine, unknown method or duplicate name stops startup with exit code 1.
-  `["bing", "bing@http"]` is a duplicate. An `@browser` item requires `scour serve --browser`.
-  Google is planned as a browser-only engine.
+  `["bing", "bing@http"]` is a duplicate. An item that needs the browser requires `scour serve --browser`.
+  Google is a browser-only engine, so `google@http` is a bad item.
   `[testing.base_urls]` applies to both methods.
   The same exit code applies to an unknown key, an empty list, or a missing `--config` file. A TOML error shows a
   redacted parser message and the line number.
@@ -278,7 +280,8 @@ flowchart LR
 - **Health from the response status and body.** A DuckDuckGo challenge can arrive with HTTP 200 or 202.
   The explicit no-results marker lets the DuckDuckGo reader report `parse_failed` when result markup changes.
 - **The method of each engine comes from the config or the query.** The config sets the default method.
-  An agent can set `@http` or `@browser` for one query. Google is planned as a browser-only engine.
+  An agent can set `@http` or `@browser` for one query. Google is a browser-only engine, so a bare `google`
+  item uses the browser method.
   - Reason: Bing over plain HTTP gave 0 of 238 matching results, and Google has no `http` method. A person can
     send an engine through the browser when its HTTP answers are bad. In headful Chrome, Bing was not stable:
     spike #31 got Turnstile and then off-topic results, and spike #32 got results on 6 of 6 queries.

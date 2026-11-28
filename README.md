@@ -1,7 +1,7 @@
 # scour
 
 scour is a local search tool. One daemon asks DuckDuckGo by default. You and your agents use that daemon.
-A person can turn on Bing in a configuration file.
+A person can turn on Bing in a configuration file, and Google with `--browser`.
 
 scour is for personal use. Do not run scour as a public instance.
 
@@ -51,7 +51,8 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
    ```
 
 `scour search` prints the results that the engines return. With only DuckDuckGo enabled, its saved page gives 10 results.
-Each result has a title, a URL and a snippet. The URL is the address of the result site.
+Each result has a title, a URL and a snippet. A Google result also has an optional `domain`: the host from `<cite>`.
+The URL of a Google web result is the Google redirect. The URL of a Google video card is the video address.
 
 When several engines are enabled, the daemon queries them in parallel. A query with `--engines` asks only the
 named engines. The daemon reports their states in config order. Each answer has `engines[]`, and each entry has
@@ -62,10 +63,10 @@ It keeps the first occurrence of each exact URL and numbers the merged results f
 | State | Meaning |
 | --- | --- |
 | `ok` | The engine returned results. |
-| `empty` | DuckDuckGo showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
-| `blocked` | The engine is resting, returned HTTP 403 or 429, or DuckDuckGo showed a challenge page. |
+| `empty` | DuckDuckGo or Google showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
+| `blocked` | The engine is resting, returned HTTP 403 or 429, DuckDuckGo showed a challenge page, or Google showed its `/sorry/` page. |
 | `limited` | The engine reached its daily limit, or its next pace slot is more than 30 seconds or one refill interval away. |
-| `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. |
+| `parse_failed` | DuckDuckGo or Google returned HTTP 200 with neither recognized results nor a no-results marker. |
 | `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
 
 The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed` and `error` to stderr.
@@ -106,7 +107,14 @@ Install Chrome or Chromium and put `Xvfb` on `PATH`. Set `CHROME` to the executa
 ./target/release/scour serve --browser
 # In a second terminal:
 ./target/release/scour search --engines duckduckgo@browser "rust async runtime"
+./target/release/scour search --engines google "rust async runtime"
 ```
+
+Google only uses the browser. A bare `google` item is the browser method, and `google@http` is a bad item.
+A Google web result URL is the absolute `/goto?url=` redirect. Spike #37 found no free source for the target URL,
+so owner decision B keeps the redirect. A `/url?q=<target>` link uses the plain target, because it needs no extra
+request. A video card uses its exact `data-curl` URL. Each result has `domain` when `<cite>` shows a host.
+The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`.
 
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
 A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
@@ -127,7 +135,8 @@ Stop the daemon with Ctrl-C or SIGTERM to close Chrome and Xvfb and delete the t
    docker run -d --name scour -p 127.0.0.1:7268:7268 scour
    ```
 
-The image contains the HTTP engines. It is about 138 MB on x86_64 and 159 MB on arm64.
+The image contains the HTTP engines. Google needs Chrome and Xvfb, so this image cannot use it.
+The image is about 138 MB on x86_64 and 159 MB on arm64.
 Use `http://127.0.0.1:7268` on the host to reach the daemon.
 
 On arm64, `docker build -t scour .` builds natively. On x86_64, enable arm64 emulation through `binfmt`
@@ -194,9 +203,12 @@ Or start the daemon with a file:
 ./target/release/scour serve --config /path/to/config.toml
 ```
 
-The `engines` list accepts `duckduckgo` and `bing`. A bare name means `http`.
-With `scour serve --browser`, use `engines = ["duckduckgo@browser"]` to make Chrome the default for DuckDuckGo.
-An `@browser` item stops startup with exit code 1 if the browser tier is off.
+The `engines` list accepts `duckduckgo`, `bing` and `google`. A bare name uses the engine default: `http` for
+DuckDuckGo and Bing, and `browser` for Google.
+With `scour serve --browser`, use `engines = ["duckduckgo@browser", "google"]` to send DuckDuckGo through Chrome
+and to add Google.
+An item that needs the browser stops startup with exit code 1 if the browser tier is off.
+`google@http` is a bad item, because Google has no `http` method.
 Invalid TOML stops the daemon with exit code 1. The same exit code applies to an unknown key, an unknown or
 duplicate engine name, an unknown method, an empty list, or a missing `--config` file.
 A TOML error shows a redacted parser message and the line number.

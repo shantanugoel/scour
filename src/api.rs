@@ -34,6 +34,8 @@ pub struct ResultItem {
     pub url: String,
     pub title: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     pub engine: String,
     pub position: u32,
 }
@@ -242,6 +244,7 @@ mod tests {
             url: "https://tokio.rs/".to_string(),
             title: "Tokio".to_string(),
             content: body.to_string(),
+            domain: None,
         }])
     }
 
@@ -254,6 +257,7 @@ mod tests {
             name: "test",
             base_url: base,
             profile: wreq_util::Profile::Chrome149,
+            methods: &[Method::Http],
             request_url: engine_url,
             read: read_page,
         }));
@@ -577,6 +581,7 @@ bing = "{engine_base}"
                 url: "https://tokio.rs/".to_string(),
                 title: "Tokio".to_string(),
                 content: String::new(),
+                domain: None,
                 engine: "bing".to_string(),
                 position: 1,
             }]

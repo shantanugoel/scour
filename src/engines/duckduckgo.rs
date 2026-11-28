@@ -1,4 +1,4 @@
-use super::{Engine, Hit, Page, accepted_result, is_host, plain_text, selector};
+use super::{Engine, Hit, Method, Page, accepted_result, is_host, plain_text, selector};
 
 const SITE: &str = "duckduckgo.com";
 
@@ -6,6 +6,7 @@ pub const ENGINE: Engine = Engine {
     name: "duckduckgo",
     base_url: "https://html.duckduckgo.com",
     profile: wreq_util::Profile::Chrome149,
+    methods: &[Method::Http, Method::Browser],
     request_url,
     read,
 };
@@ -73,6 +74,7 @@ fn parse(document: &scraper::Html) -> Vec<Hit> {
             url,
             title,
             content,
+            domain: None,
         });
     }
     hits

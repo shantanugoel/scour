@@ -1,3 +1,137 @@
+use super::{Engine, Hit, Method, Page, accepted_result, is_host, plain_text, selector};
+
+const SITE: &str = "google.com";
+const BASE: &str = "https://www.google.com";
+
+pub const ENGINE: Engine = Engine {
+    name: "google",
+    base_url: BASE,
+    profile: wreq_util::Profile::Chrome149,
+    methods: &[Method::Browser],
+    request_url,
+    read,
+};
+
+fn request_url(base: &url::Url, query: &str) -> url::Url {
+    let mut url = base.join("/search").expect("google search url");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("hl", "en")
+        .append_pair("pws", "0");
+    url
+}
+
+fn read(_status: u16, body: &str) -> Page {
+    let document = scraper::Html::parse_document(body);
+    let challenge = selector("form#captcha-form, .g-recaptcha");
+    if document.select(&challenge).next().is_some() {
+        return Page::Blocked;
+    }
+
+    let hits = parse(&document);
+    if !hits.is_empty() {
+        return Page::Results(hits);
+    }
+
+    if no_results(&document) {
+        Page::Empty
+    } else {
+        Page::ParseFailed
+    }
+}
+
+/// Google puts this text in `#topstuff` when it found no matching pages.
+fn no_results(document: &scraper::Html) -> bool {
+    let marker = selector("#topstuff");
+    document.select(&marker).any(|node| {
+        plain_text(&node.text().collect::<String>()).contains("did not match any documents")
+    })
+}
+
+/// Organic results in page order. The short-video carousel and the question box have no title
+/// heading, so they are not results.
+fn parse(document: &scraper::Html) -> Vec<Hit> {
+    let item_selector = selector("#rso div.MjjYud");
+    let title_selector = selector("h3");
+    let snippet_selector = selector(".VwiC3b");
+    let cite_selector = selector("cite");
+    let curl_selector = selector("[data-curl]");
+    let link_selector = selector("a[href]");
+    let mut hits = Vec::new();
+    for item in document.select(&item_selector) {
+        let Some(title_node) = item.select(&title_selector).next() else {
+            continue;
+        };
+        let title = plain_text(&title_node.text().collect::<String>());
+        if title.is_empty() {
+            continue;
+        }
+        let Some(url) = item
+            .select(&curl_selector)
+            .next()
+            .and_then(|node| node.attr("data-curl"))
+            .map(str::to_string)
+            .or_else(|| {
+                item.select(&link_selector)
+                    .next()
+                    .and_then(|link| link.attr("href"))
+                    .and_then(result_url)
+            })
+        else {
+            continue;
+        };
+        let content = item
+            .select(&snippet_selector)
+            .next()
+            .map(|node| plain_text(&node.text().collect::<String>()))
+            .unwrap_or_default();
+        let domain = item
+            .select(&cite_selector)
+            .next()
+            .and_then(|cite| domain_of(&plain_text(&cite.text().collect::<String>())));
+        hits.push(Hit {
+            url,
+            title,
+            content,
+            domain,
+        });
+    }
+    hits
+}
+
+fn result_url(href: &str) -> Option<String> {
+    let base = url::Url::parse(BASE).ok()?;
+    let parsed = base.join(href).ok()?;
+    if !parsed.host_str().is_some_and(|host| is_host(host, SITE)) {
+        return accepted_result(&parsed, SITE);
+    }
+    match parsed.path() {
+        // The target costs no extra request. Keep the redirect only when Google hides it.
+        "/url" => {
+            let target = parsed.query_pairs().find(|(key, _)| key == "q")?.1;
+            accepted_result(&url::Url::parse(&target).ok()?, SITE)
+        }
+        "/goto" => Some(parsed.to_string()),
+        _ => None,
+    }
+}
+
+/// The host that `<cite>` shows, or nothing when it shows only a date or a count.
+fn domain_of(cite: &str) -> Option<String> {
+    let first = cite.split_whitespace().next()?;
+    let host = first
+        .strip_prefix("https://")
+        .or_else(|| first.strip_prefix("http://"))
+        .unwrap_or(first)
+        .trim_end_matches(['.', ',', '·', '›']);
+    (host.contains('.')
+        && host.chars().any(|c| c.is_ascii_alphabetic())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+    .then(|| host.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::ENGINE;
@@ -22,6 +156,16 @@ mod tests {
             Page::Results(hits) => hits,
             other => panic!("the page has results, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_url_form_encodes_the_query_and_sets_english() {
+        let base = url::Url::parse(ENGINE.base_url).unwrap();
+        let url = (ENGINE.request_url)(&base, "rust async runtime");
+        assert_eq!(
+            url.as_str(),
+            "https://www.google.com/search?q=rust+async+runtime&hl=en&pws=0"
+        );
     }
 
     #[test]
@@ -117,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn a_url_redirect_link_is_made_absolute() {
+    fn a_url_redirect_link_uses_the_target_from_q() {
         let page = WEB_RESULTS_PAGE.replacen(
             r#"href="/goto?url=REDACTED""#,
             r#"href="/url?q=https://go.dev/doc/database/cancel-operations&amp;sa=U""#,
@@ -126,10 +270,7 @@ mod tests {
         assert_ne!(page, WEB_RESULTS_PAGE);
         let hits = results(&page);
         assert_eq!(hits.len(), 10);
-        assert_eq!(
-            hits[0].url,
-            "https://www.google.com/url?q=https://go.dev/doc/database/cancel-operations&sa=U"
-        );
+        assert_eq!(hits[0].url, "https://go.dev/doc/database/cancel-operations");
         assert_eq!(hits[0].domain.as_deref(), Some("go.dev"));
     }
 
