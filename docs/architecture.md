@@ -149,7 +149,7 @@ flowchart LR
   can add `bing`. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
   An item is `<name>` or `<name>@<method>`, as in `["duckduckgo", "bing@http"]`. A bare name uses `http`, the
   only method that scour runs today. A bad item stops startup with exit code 1: an unknown engine name, an
-  unknown method such as `@ftp`, or a duplicate name. A duplicate name fails also when the methods differ, as in
+  unknown method such as `@ftp`, or a duplicate name. A duplicate name fails also when only one item names the method, as in
   `["bing", "bing@http"]`. Planned: the browser tier runs `@browser` items, and Google has only the `browser`
   method. Today an `@browser` item stops startup with exit code 1 and a message that names `--browser`.
   `[testing.base_urls]` applies to both methods.
