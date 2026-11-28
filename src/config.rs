@@ -236,4 +236,31 @@ mod tests {
         let config = load_text("two-engines", "engines = [\"duckduckgo\", \"bing\"]\n").unwrap();
         assert_eq!(names(&config), ["duckduckgo", "bing"]);
     }
+
+    #[test]
+    fn proxy_with_an_encoded_password_or_a_bare_slash_loads_its_host() {
+        // Url gives an HTTP URL without a path the path `/`, so a bare `/` is not a path.
+        for (url, address) in [
+            (
+                "http://alice:12%23secret@proxy.example:8080",
+                "http://proxy.example:8080",
+            ),
+            (
+                "http://alice:12%3Fsecret@proxy.example:8080/",
+                "http://proxy.example:8080",
+            ),
+            (
+                "socks5://alice:12%2Fsecret@proxy.example:1080",
+                "socks5://proxy.example:1080",
+            ),
+            (
+                "socks5h://proxy.example:1080/",
+                "socks5h://proxy.example:1080",
+            ),
+        ] {
+            let config = load_text("valid-proxy", &format!("proxy = \"{url}\"\n")).unwrap();
+            let proxy = config.proxy.expect(url);
+            assert_eq!(proxy_address(&proxy), address, "{url}");
+        }
+    }
 }

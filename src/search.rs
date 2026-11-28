@@ -321,7 +321,8 @@ mod tests {
     async fn http_proxy_receives_connect_for_duckduckgo() {
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = proxy.local_addr().unwrap();
-        let config = proxy_config("http", address, "fixture-user:fixture-password@");
+        // A `#` in the password must be percent-encoded, and the proxy gets it decoded.
+        let config = proxy_config("http", address, "fixture-user:fixture%23password@");
         let searcher = Arc::new(Searcher::new(&config).unwrap());
 
         timeout(Duration::from_secs(3), async {
@@ -338,7 +339,7 @@ mod tests {
                 );
                 use base64::Engine as _;
                 let credentials = base64::engine::general_purpose::STANDARD
-                    .encode("fixture-user:fixture-password");
+                    .encode("fixture-user:fixture#password");
                 let auth = format!("Basic {credentials}");
                 assert!(request.lines().any(|line| {
                     line.split_once(": ").is_some_and(|(name, value)| {

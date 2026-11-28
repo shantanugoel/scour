@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const PROXY_USER: &str = "fixture-user";
 const PROXY_PASSWORD: &str = "fixture-password";
@@ -11,12 +12,25 @@ fn config_file(name: &str, text: &str) -> PathBuf {
 }
 
 fn serve_with_config(path: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_scour"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scour"))
         .arg("serve")
         .arg("--config")
         .arg(path)
-        .output()
-        .unwrap()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A config that is wrongly accepted starts a daemon that never exits.
+    // Stop it, so that the test fails instead of waiting forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
 }
 
 fn serve_without_config(xdg_config_home: Option<&Path>, home: &Path) -> Output {
@@ -92,6 +106,40 @@ fn invalid_proxy_exits_one_without_credentials() {
         let stderr = assert_exit_one(&output, "proxy must be");
         assert_no_proxy_credentials(&stderr);
         assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn proxy_with_a_path_query_or_fragment_exits_one_without_any_part_of_the_url() {
+    // An unencoded `#`, `?` or `/` in the password ends the host part early.
+    for url in [
+        "http://alice:12#secret@proxy.example:8080",
+        "http://alice:12?secret@proxy.example:8080",
+        "http://alice:12/secret@proxy.example:8080",
+        "socks5h://alice:12#secret@proxy.example:1080",
+        "http://alice:secret@proxy.example:8080/x",
+        "socks5://alice:secret@proxy.example:1080/x",
+        "http://alice:secret@proxy.example:8080/?x",
+        "http://alice:secret@proxy.example:8080#x",
+        "http://alice:secret@proxy.example:8080?",
+        "http://alice:secret@proxy.example:8080#",
+    ] {
+        let path = config_file("proxy-url-parts", &format!("proxy = \"{url}\"\n"));
+        let output = serve_with_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for part in ["alice", "12", "secret", "proxy.example", "8080", "1080"] {
+            assert!(
+                !stdout.contains(part) && !stderr.contains(part),
+                "{url}: {stdout}{stderr}"
+            );
+        }
+        assert_eq!(output.status.code(), Some(1), "{url}: {stderr}");
+        assert!(
+            stderr.contains("percent-encode") && stderr.contains("password"),
+            "{url}: {stderr}"
+        );
     }
 }
 
