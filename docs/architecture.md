@@ -41,7 +41,7 @@ flowchart LR
 | Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. It checks the whole list before it sends any engine request. The cascade sends `browser` engines through the browser tier when `--browser` is set. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | built |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, supported methods, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is built as a browser-only engine. It uses `https://www.google.com/search?q=<q>&hl=en&pws=0`. A web result URL is the absolute Google `/goto?url=` redirect, because the result page gives no free target URL. A `/url?q=<target>` link uses the plain target, because it costs no extra request. A video card uses its exact `data-curl` URL when that is an http(s) URL on another site. Each result has a `domain` from the host in `<cite>`, and the field is absent when `<cite>` shows only a date or a count. The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`. Both methods use the same `request_url` and `read`. The browser method reads the DOM after the page loads. Planned: `profile` becomes optional for browser-only engines, and `read` can give `Page::Challenge(kind)`. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo, Bing and Google |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. Google has no HTTP method. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
-| Browser tier | Starts one Chrome on Xvfb on the first browser query. Every Chrome request uses one command-line proxy: the config proxy, or a local SOCKS5 forwarder that allows IPv4 only. `fetch(url)` opens a tab in one shared query context, reads the main document status and rendered HTML, then closes the tab. The CDP port is fixed at `127.0.0.1:7269`. See "Browser lifecycle" below. | `chromiumoxide` 0.9 | built |
+| Browser tier | Starts one Chrome on Xvfb on the first browser query. Every Chrome request uses one command-line proxy: the config proxy, or a local SOCKS5 forwarder that allows IPv4 only. Each query opens a tab in one shared query context, reads the main document status and rendered HTML, then closes the tab. The CDP port is fixed at `127.0.0.1:7269`. See "Browser lifecycle" below. | `chromiumoxide` 0.9 | built |
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Both methods of an engine share this state. | Rust, in memory | built for DuckDuckGo, Bing and Google |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo, Bing and Google pages test the parsers. The Google fixtures are `fixtures/google/results.html` (the #15 page from more than 3 hours after a solve, 8 results), `web-results.html` (the #37 page, 10 results) and `sorry.html`. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo, Bing and Google |
@@ -78,7 +78,11 @@ flowchart LR
   The daemon kills Chrome's process group, deletes the run directory, stops Xvfb with SIGTERM, and releases the lock.
   It sends SIGKILL if Xvfb takes more than five seconds to stop. A teardown keeps the state lock until the old
   session is gone, so a new start never overlaps it.
-- Tab limits and a user-supplied CDP URL are planned.
+- The daemon allows four query tabs (`TABS = 4`). This fits the default burst of three requests.
+  In the local Chromium measurements, four tabs used 396 MiB on the saved fixture and 733 MiB on the heavy fixture.
+  Eight tabs used over 1 GiB on the heavy fixture. A close task keeps the tab permit until it closes the target.
+- Shutdown aborts any start in progress and waits for its process and profile cleanup.
+- A user-supplied CDP URL is planned.
 
 ### Browser proxy
 
@@ -172,9 +176,13 @@ result link and downloads no file, so this costs nothing.
   If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 - **Request limits.** Each engine HTTP request has a 10-second timeout and a limit of 10 redirects.
   The CLI waits up to 45 seconds for a response from the daemon.
-  A browser page has a 10-second timeout. The first query also allows 30 seconds each for Xvfb and Chrome to start,
-  because a cold CI start took more than 10 seconds.
-  Planned: a total browser budget (#44) that includes the wait for a free tab. A timeout gives `error`.
+  A browser query has 40 seconds from admission for the pace wait, the browser start, the tab wait and the page.
+  The page gets up to 10 seconds of the remaining time, including the time to open its tab.
+  Xvfb and Chrome each have 30 seconds to start. The start task keeps running if the query runs out of time.
+  A timed-out browser query reports `error` with one of these messages:
+  - `Chrome is still starting; search again in a few seconds` if the start or state lock takes too long.
+  - `all 4 browser tabs stayed busy for {n} s` if no tab becomes free.
+  - `no answer from {host} in {n} s` if the tab takes too long to open, load or read.
 - **Pace and daily limits.** Admission checks active rest first, then the rolling daily limit, then pace.
   By default, each engine starts with three tokens and refills one every 120 seconds, up to three.
   Each engine defaults to 100 requests per 24 hours. The `[limits]` keys `burst`, `refill_seconds` and `daily`
@@ -183,6 +191,7 @@ result link and downloads no file, so this costs nothing.
   The 30-second cap and the 10-second engine timeout fit within the CLI's 45-second wait.
   Otherwise, admission reserves the token and adds the request to the daily count. It releases the lock before any wait.
   If rest begins during the wait, the daemon cancels the send and refunds its daily reservation.
+  If the daemon cannot open a browser tab, it also refunds the daily reservation. The pace token remains spent.
   Failed sends count. At the daily limit, `ready_at` is the oldest request's admission time plus 24 hours.
   After a paced run of 60 queries, DuckDuckGo blocked the test IP for more than 12 hours.
   The research estimate was 50 to 100 queries per day from one IP. [Spike #14](https://github.com/shantanugoel/scour/issues/14) and [follow-up #35](https://github.com/shantanugoel/scour/issues/35).

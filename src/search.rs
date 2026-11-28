@@ -17,6 +17,8 @@ use crate::engines::{self, Engine, Hit, Method, Page};
 use crate::limits::{Admit, Limits};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
+// MAX_PACE_WAIT + TIMEOUT, below the 45 s CLI wait.
+pub(crate) const QUERY_BUDGET: Duration = Duration::from_secs(40);
 
 pub struct Searcher {
     client: wreq::Client,
@@ -262,6 +264,7 @@ impl Searcher {
             }
             Admit::SendAt(send_at) => send_at,
         };
+        let deadline = now + QUERY_BUDGET;
         if send_at > now {
             sleep_until(send_at).await;
             let ready_at = slot
@@ -276,7 +279,22 @@ impl Searcher {
         let url = (slot.engine.request_url)(&slot.base_url, query);
         let answer = match method {
             Method::Http => self.fetch_http(slot.engine, &url).await,
-            Method::Browser => self.fetch_browser(slot.engine, &url).await,
+            Method::Browser => {
+                let browser = self.browser.as_ref().expect("validated browser method");
+                match browser.open_tab(deadline).await {
+                    Ok(tab) => match tab.render(&url).await {
+                        Ok(page) => answer_for(slot.engine, page.status, &page.html),
+                        Err(message) => Answer::error(message),
+                    },
+                    Err(error) => {
+                        slot.limits
+                            .lock()
+                            .expect("engine limits")
+                            .release((now, wall));
+                        Answer::error(error.message(&url))
+                    }
+                }
+            }
         };
         let ready_at = slot.limits.lock().expect("engine limits").record(
             answer.state,
@@ -307,14 +325,6 @@ impl Searcher {
                 }
             }
             Err(err) => Answer::error(fetch_error(&err, host)),
-        }
-    }
-
-    async fn fetch_browser(&self, engine: &Engine, url: &Url) -> Answer {
-        let browser = self.browser.as_ref().expect("validated browser method");
-        match browser.fetch(url).await {
-            Ok(page) => answer_for(engine, page.status, &page.html),
-            Err(message) => Answer::error(message),
         }
     }
 }
