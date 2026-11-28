@@ -769,7 +769,6 @@ impl Drop for DisplayLock {
 #[cfg(test)]
 mod tests {
     use super::connect_error;
-    use url::Url;
 
     #[test]
     fn a_forwarder_error_without_a_proxy_does_not_name_the_proxy() {
