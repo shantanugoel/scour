@@ -1,5 +1,55 @@
+use serde::{Deserialize, Serialize};
+
 pub mod bing;
 pub mod duckduckgo;
+
+/// How a query reaches an engine. The browser tier arrives in a later slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Method {
+    Http,
+    Browser,
+}
+
+impl Method {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "http" => Some(Self::Http),
+            "browser" => Some(Self::Browser),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Browser => "browser",
+        }
+    }
+
+    /// The browser tier is not built, so every browser item is unavailable.
+    pub fn check_available(self, item: &str) -> Result<(), String> {
+        if self == Self::Browser {
+            return Err(format!(
+                "{item} needs the browser; start scour serve with --browser"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Splits an `engines` item into its name and optional method.
+pub fn parse_item(item: &str) -> Result<(&str, Option<Method>), String> {
+    let Some((name, method)) = item.split_once('@') else {
+        return Ok((item, None));
+    };
+    let Some(method) = Method::parse(method) else {
+        return Err(format!(
+            "unknown method in engine item `{item}`; use `name` or `name@http`"
+        ));
+    };
+    Ok((name, Some(method)))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -8,7 +58,7 @@ pub struct Hit {
     pub content: String,
 }
 
-/// One cheap HTTP engine. The URL builder and the page reader are pure functions.
+/// One cheap engine. The URL builder and the page reader are pure functions.
 #[derive(Debug)]
 pub struct Engine {
     pub name: &'static str,

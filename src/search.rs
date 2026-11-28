@@ -12,7 +12,7 @@ use crate::api::{
     EngineHealth, EngineState, EngineStatus, ResultItem, SearchResponse, StatusResponse,
 };
 use crate::config::Config;
-use crate::engines::{Engine, Hit, Page};
+use crate::engines::{self, Engine, Hit, Method, Page};
 use crate::limits::{Admit, Limits};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,6 +25,7 @@ pub struct Searcher {
 
 struct EngineSlot {
     engine: &'static Engine,
+    method: Method,
     base_url: Url,
     limits: Mutex<Limits>,
 }
@@ -73,6 +74,11 @@ impl Searcher {
             .iter()
             .map(|engine| EngineSlot {
                 engine,
+                method: config
+                    .methods
+                    .get(engine.name)
+                    .copied()
+                    .unwrap_or(Method::Http),
                 base_url: config
                     .base_urls
                     .get(engine.name)
@@ -89,9 +95,60 @@ impl Searcher {
     }
 
     pub async fn search(self: &Arc<Self>, query: &str) -> SearchResponse {
+        let selection: Vec<_> = self
+            .engines
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (index, slot.method))
+            .collect();
+        self.run(query, &selection).await
+    }
+
+    /// Asks only the named engines. An item is `name` or `name@method`.
+    pub async fn search_selected(
+        self: &Arc<Self>,
+        query: &str,
+        engines: Option<&[&str]>,
+    ) -> Result<SearchResponse, String> {
+        let Some(items) = engines else {
+            return Ok(self.search(query).await);
+        };
+        Ok(self.run(query, &self.select(items)?).await)
+    }
+
+    /// Checks the whole list before any engine request goes out.
+    fn select(&self, items: &[&str]) -> Result<Vec<(usize, Method)>, String> {
+        if items.is_empty() {
+            return Err("the engines list is empty".to_string());
+        }
+        let mut selected: Vec<(usize, Method)> = Vec::with_capacity(items.len());
+        for item in items {
+            let (name, method) = engines::parse_item(item)?;
+            let Some(index) = self
+                .engines
+                .iter()
+                .position(|slot| slot.engine.name == name)
+            else {
+                return Err(if engines::find(name).is_some() {
+                    format!("engine `{item}` is not enabled")
+                } else {
+                    format!("unknown engine `{item}`")
+                });
+            };
+            if selected.iter().any(|(chosen, _)| *chosen == index) {
+                return Err(format!("engine `{item}` is listed more than once"));
+            }
+            let method = method.unwrap_or(self.engines[index].method);
+            method.check_available(item)?;
+            selected.push((index, method));
+        }
+        Ok(selected)
+    }
+
+    async fn run(self: &Arc<Self>, query: &str, selection: &[(usize, Method)]) -> SearchResponse {
         let query = Arc::<str>::from(query);
         let mut tasks = JoinSet::new();
-        for index in 0..self.engines.len() {
+        for &(index, method) in selection {
             let searcher = self.clone();
             let query = query.clone();
             tasks.spawn(async move {
@@ -99,6 +156,7 @@ impl Searcher {
                 let (answer, ready_at) = searcher.search_engine(slot, &query).await;
                 let status = EngineStatus {
                     name: slot.engine.name.to_string(),
+                    method,
                     state: answer.state,
                     daily_count: slot
                         .limits

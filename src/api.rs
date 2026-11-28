@@ -8,6 +8,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::engines::Method;
 use crate::search::Searcher;
 
 /// The daemon listens here. No flag, variable or file can change it.
@@ -51,6 +52,7 @@ pub enum EngineState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub name: String,
+    pub method: Method,
     pub state: EngineState,
     pub daily_count: u32,
     pub daily_limit: u32,
@@ -78,11 +80,12 @@ pub struct EngineHealth {
 #[derive(Debug, Deserialize)]
 struct SearchParams {
     q: Option<String>,
+    engines: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
-    error: &'static str,
+    error: String,
 }
 
 pub fn router(searcher: Arc<Searcher>) -> axum::Router {
@@ -103,7 +106,7 @@ async fn guard_local(request: Request, next: Next) -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(ErrorBody {
-            error: "the Host or Origin is not local",
+            error: "the Host or Origin is not local".to_string(),
         }),
     )
         .into_response()
@@ -147,12 +150,22 @@ async fn get_search(
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: "the query parameter q is missing",
+                error: "the query parameter q is missing".to_string(),
             }),
         )
             .into_response();
     };
-    let body = searcher.search(query).await;
+    let engines: Option<Vec<&str>> = params.engines.as_deref().map(|list| {
+        if list.is_empty() {
+            Vec::new()
+        } else {
+            list.split(',').collect()
+        }
+    });
+    let body = match searcher.search_selected(query, engines.as_deref()).await {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(ErrorBody { error })).into_response(),
+    };
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -627,7 +640,7 @@ bing = "{engine_base}"
             assert_eq!(health[index]["ready_at"], ready_at);
             assert!(
                 text.contains(&format!(
-                    "{name}: {state_text} ({count}/200 daily) until {ready_at} (in "
+                    "{name}@http: {state_text} ({count}/200 daily) until {ready_at} (in "
                 )),
                 "{text}"
             );
@@ -814,35 +827,35 @@ bing = "{engine_base}"
                 "",
                 "empty",
                 false,
-                "test: empty (0 results)",
+                "test@http: empty (0 results)",
             ),
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "",
                 "error",
                 true,
-                "test: error: HTTP 503",
+                "test@http: error: HTTP 503",
             ),
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 "",
                 "blocked",
                 true,
-                "test: blocked",
+                "test@http: blocked",
             ),
             (
                 StatusCode::ACCEPTED,
                 "block page",
                 "blocked",
                 true,
-                "test: blocked",
+                "test@http: blocked",
             ),
             (
                 StatusCode::OK,
                 "changed markup",
                 "parse_failed",
                 true,
-                "test: parse_failed",
+                "test@http: parse_failed",
             ),
         ];
         for (engine_status, body, state, is_error, expected_text) in cases {
@@ -1006,7 +1019,7 @@ bing = "{engine_base}"
             .map(|name| format!("\"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut text = format!("engines = [{list}]\n[testing.base_urls]\n");
+        let mut text = format!("engines = [{list}]\n[limits]\nburst = 10\n[testing.base_urls]\n");
         for name in names {
             text.push_str(&format!("{name} = \"{engine_base}\"\n"));
         }

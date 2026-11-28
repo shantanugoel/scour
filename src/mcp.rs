@@ -32,6 +32,8 @@ pub struct ScourMcp {
 struct SearchParams {
     /// The words to search for.
     query: String,
+    /// The engines to ask, as `name` or `name@method`. Default: all enabled engines.
+    engines: Option<Vec<String>>,
 }
 
 impl ScourMcp {
@@ -54,7 +56,23 @@ impl ScourMcp {
         if query.is_empty() {
             return CallToolResult::error(vec![ContentBlock::text("scour: the query is empty")]);
         }
-        answer(&self.searcher.search(query).await)
+        let engines: Option<Vec<&str>> = params
+            .engines
+            .as_ref()
+            .map(|items| items.iter().map(String::as_str).collect());
+        let response = match self
+            .searcher
+            .search_selected(query, engines.as_deref())
+            .await
+        {
+            Ok(response) => response,
+            Err(message) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "scour: {message}"
+                ))]);
+            }
+        };
+        answer(&response)
     }
 }
 

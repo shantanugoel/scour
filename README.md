@@ -33,6 +33,17 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
    ./target/release/scour search "rust async runtime"
    ```
 
+   To ask only some engines for one query, pass a comma list to `--engines`. Each item is an engine name, or a
+   name with a method after `@`.
+
+   ```sh
+   ./target/release/scour search --engines duckduckgo "rust async runtime"
+   ```
+
+   Only the `http` method exists today. An item with `@browser` fails, because the browser tier is not built.
+   An item can name only an engine that the config enables. The same list works in
+   `GET /search?engines=duckduckgo` and in the MCP `engines` argument.
+
 3. Check engine status without sending a search.
 
    ```sh
@@ -42,7 +53,9 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 `scour search` prints the results that the engines return. With only DuckDuckGo enabled, its saved page gives 10 results.
 Each result has a title, a URL and a snippet. The URL is the address of the result site.
 
-When several engines are enabled, the daemon queries them in parallel. It reports their states in config order.
+When several engines are enabled, the daemon queries them in parallel. A query with `--engines` asks only the
+named engines. The daemon reports their states in config order. Each answer has `engines[]`, and each entry has
+`name`, `method`, `state`, `daily_count` and `daily_limit`. `method` is `http` today.
 The daemon takes one result from each engine in config order, then repeats for each rank.
 It keeps the first occurrence of each exact URL and numbers the merged results from 1.
 
@@ -57,7 +70,11 @@ It keeps the first occurrence of each exact URL and numbers the merged results f
 
 The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed` and `error` to stderr.
 If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with code 1.
-Each engine summary includes the daily count and limit, for example `1/100 daily`.
+Each summary line starts with `name@method`, for example `duckduckgo@http: ok (8 results) (1/100 daily)`.
+
+A bad `engines` list stops the query with HTTP 400 (MCP `isError: true`), and no engine request goes out.
+The message names the item. A bad list has an unknown name, an engine that is not enabled, a duplicate name,
+an empty list, or an unknown method. An `@browser` item fails with a message that names `--browser`.
 
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
 An `ok` response resets the backoff. An `empty`, `parse_failed` or `error` response leaves it unchanged.
@@ -84,8 +101,9 @@ When a deadline appears, `scour status` also prints the remaining time.
 ## Use MCP
 
 The daemon also answers MCP over streamable HTTP at `http://127.0.0.1:7268/mcp`. It has one tool, `search`, with
-one argument, `query`. `structuredContent` is the `GET /search` JSON, and `content[0].text` is the text of
-`scour search`. A blank query, or an answer in which no engine returns `ok` or `empty`, sets `isError`.
+the required argument `query` and the optional `engines` list. `engines` takes the same items as `--engines`.
+`structuredContent` is the `GET /search` JSON, and `content[0].text` is the text of
+`scour search`. A blank query, a bad `engines` list, or an answer in which no engine returns `ok` or `empty` sets `isError`.
 
 To add the server to Claude Code:
 
@@ -116,8 +134,12 @@ Or start the daemon with a file:
 ./target/release/scour serve --config /path/to/config.toml
 ```
 
-The `engines` list accepts `duckduckgo` and `bing`. Invalid TOML stops the daemon with exit code 1. The same exit
-code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing `--config` file.
+The `engines` list accepts `duckduckgo` and `bing`. Each item can end with `@http`, for example
+`["duckduckgo@http", "bing"]`. A bare name means `http`.
+Only the `http` method exists. An item with `@browser` stops startup with exit code 1 and a message that
+names `--browser`, because the browser tier is planned.
+Invalid TOML stops the daemon with exit code 1. The same exit code applies to an unknown key, an unknown or
+duplicate engine name, an unknown method, an empty list, or a missing `--config` file.
 A TOML error shows a redacted parser message and the line number.
 
 Set the optional `proxy` key to send all engine requests through one proxy.

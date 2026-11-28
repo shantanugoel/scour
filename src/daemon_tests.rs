@@ -161,7 +161,7 @@ async fn cli_engines_option_asks_only_the_named_engine_and_prints_a_bad_item() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("duckduckgo: ok ("), "{stdout}");
+    assert!(stdout.contains("duckduckgo@http: ok ("), "{stdout}");
     assert!(!stdout.contains("bing"), "{stdout}");
     for item in ["yahoo", "duckduckgo@browser", "--browser"] {
         assert!(stderr.contains(item), "{item}: {stderr}");

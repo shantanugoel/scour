@@ -36,10 +36,10 @@ flowchart LR
 | Part | What it does | Technology | Status |
 | --- | --- | --- | --- |
 | Daemon | Serves the JSON API and MCP on `127.0.0.1:7268` only. One layer rejects every request with a foreign `Host` or `Origin`. | `tokio`, `axum` | built |
-| MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The tool description warns that titles and snippets are untrusted web text. Planned: an optional `engines` argument selects the engines and the method of each engine for one query (refer to "Data → Search result"). Also planned: the answer shows the open challenges. | `rmcp` (streamable HTTP, stateless JSON) | built |
-| JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. Planned: `GET /search` accepts the same `engines` list as MCP, and `scour search --engines duckduckgo,bing@browser "q"` sends it. | `axum`, `wreq` | built; `engines` planned |
+| MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query, engines?)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The optional `engines` list selects the engines and the method of each engine for one query (refer to "Data → Search result"). The tool description warns that titles and snippets are untrusted web text. Planned: the answer shows the open challenges. | `rmcp` (streamable HTTP, stateless JSON) | built |
+| JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. `GET /search` accepts the same `engines` list as MCP, and `scour search --engines duckduckgo,bing@http "q"` sends it. | `axum`, `wreq` | built |
 | Parallel HTTP search | Starts one task per enabled engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
-| Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. The cascade sends `http` engines through the HTTP tier and `browser` engines through the browser tier. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | planned |
+| Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. It checks the whole list before it sends any engine request. The `http` method exists. Planned: the cascade sends `browser` engines through the browser tier. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | built for `http`; browser tier planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned as a browser-only engine. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. Planned: each engine has two methods, `http` and `browser`. The struct keeps one `request_url` and one `read`. `profile` becomes `http: Option<wreq_util::Profile>`, and `None` means the engine has no `http` method (Google). The `browser` method loads the same `request_url` in a tab and runs the same `read` on the HTML of the page after the load. `read` can also give `Page::Challenge(kind)` for a challenge page. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo and Bing; `browser` method planned |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
 | Browser tier | Has one function, `fetch(url) -> Rendered`. `Rendered` holds the HTTP status of the main document, the HTML of the page after the load, and the tab. The engine `read` decides whether the page is a challenge, because each saved Bing result page also loads `challenges.cloudflare.com`. The tier serves every `browser` engine from one Chrome and one profile. Each query opens a new tab and closes it after `read`. A fixed number of query tabs can be open at a time; other browser queries wait for a free tab (`tokio::sync::Semaphore`). The wait counts as part of the send. A challenge tab stays open in the challenge queue and does not use a query slot. The tier starts headful Chrome on an Xvfb display on the first browser query, or it connects to a CDP URL that the user gives. Chrome starts with `--password-store=basic` and `--use-mock-keychain`. Without them, Chromium hangs on the system keyring before it loads a page. The spikes kept Chrome on IPv4 with a local SOCKS5 proxy and `--host-resolver-rules`. How Chrome stays on IPv4 without a user proxy is not tested. It stops the browser after an idle time, but not while a challenge is open. Each CDP call has a timeout. The browser uses the same proxy as the HTTP tier. Its profile is in a temporary directory that the daemon deletes when the browser stops. The daemon deletes it on every exit path, from the moment it makes the directory: in spike #15, four early returns and one killed run left a profile on disk. Its CDP port listens on `127.0.0.1` only. | `chromiumoxide` 0.9 | planned |
@@ -51,35 +51,36 @@ flowchart LR
 ## Data
 
 - **Search result.** `GET /search?q=<text>` returns JSON. It has `query`, `results[]` with `url`, `title`,
-  `content`, `engine` and `position`, and `engines[]` with `name`, `state`, `daily_count` and `daily_limit`.
+  `content`, `engine` and `position`, and `engines[]` with `name`, `method`, `state`, `daily_count` and
+  `daily_limit`.
   The merge takes one item per engine in config order for each rank. It keeps the first occurrence of each exact
   URL string, including that item's engine, and assigns consecutive positions starting at 1.
   The `engines[]` array stays in config order even when engine tasks finish out of order.
+  `method` is the method that the query used. It is `http` today.
   `engines[].error` is present only when the state is `error`. `engines[].ready_at` is present for `blocked`
   and `limited`. It is an RFC 3339 UTC
   timestamp to the second. A missing `q`, or a query of only spaces, returns HTTP 400. `challenges[]` is
   planned. The field names are the same as in SearXNG, so the format is familiar. We do not promise SearXNG
   compatibility, and we copy no SearXNG code (AGPL). The API ignores other parameters, so a client that sends
   `format=json` still works.
-  - Planned: `engines[].method` is `http` or `browser`. It is the method that the query used.
-  - Planned: an optional `engines` list selects the engines for one query: `engines=duckduckgo,bing@browser` in
-    `GET /search`, or `"engines": ["duckduckgo", "bing@browser"]` in MCP. Each item is `<name>` or
-    `<name>@<method>`. A bare name uses the method from the config.
-  - Planned: an item can name only an engine that the config enables. A person turns engines on; an agent
-    does not.
-  - Planned: a bad list stops the whole query with HTTP 400 (MCP `isError: true`), and no engine request goes
-    out. The message names the item. Bad items are:
+  - An optional `engines` list selects the engines for one query: `engines=duckduckgo,bing@http` in
+    `GET /search`, or `"engines": ["duckduckgo", "bing@http"]` in MCP. `engines=` with nothing after it is
+    the empty list. Each item is `<name>` or `<name>@<method>`. A bare name uses the method from the config.
+  - An item can name only an engine that the config enables. A person turns engines on; an agent does not.
+  - A bad list stops the whole query with HTTP 400 (MCP `isError: true`), and no engine request goes out.
+    The message names the item. Bad items are:
     1. An unknown name, an engine that is not enabled, a duplicate name, or an empty list.
-    2. An unknown method, or `google@http`, because Google has no `http` method.
+    2. An unknown method.
     3. An `@browser` item when the browser tier is off, for example
-       `scour: bing@browser needs the browser; start scour serve with --browser`.
+       `duckduckgo@browser needs the browser; start scour serve with --browser`.
 - **Engine state.** HTTP 403 and 429 give `blocked` for any engine. For other statuses, the page reader can
   identify a block from the body. DuckDuckGo challenge pages give `blocked` at any status. Any remaining
   non-200 response gives `error` with `HTTP <n>`. Network failures and timeouts also give `error`.
   On HTTP 200, parsed results give `ok`. A DuckDuckGo no-results marker gives `empty`. Unrecognized
   DuckDuckGo pages give `parse_failed`. Bing reports `empty` when its parser finds no results on HTTP 200.
   The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed`
-  and `error` to stderr. If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with code 1.
+  and `error` to stderr. Each summary line starts with `name@method`, for example `duckduckgo@http: ok`.
+  If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with code 1.
   Planned: the `browser` method uses the same states. A `Page::Challenge` gives `blocked`, starts the rest, and
   opens a challenge. The HTTP status comes from the main document of the tab.
 - **Rest.** The first block starts a 10-minute rest by default. Each consecutive block doubles that duration, up to 4 hours.
@@ -112,11 +113,11 @@ flowchart LR
 - **MCP answer.** `POST /mcp` carries one JSON-RPC message. A request needs `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`. The server keeps no session: each request stands alone, and the
   answer is one JSON body, not an SSE stream. `tools/list` returns one tool, `search`, with the object argument
-  `{query: string}`. The optional `engines: string[]` argument is planned (refer to "Search result").
+  `{query: string, engines?: string[]}`. `required` is `["query"]`.
   For a search answer, `tools/call` returns the `GET /search` JSON in `structuredContent` and
-  the `scour search` text in `content[0].text`. A blank query sets `isError: true` and returns only the error
-  message in `content[0].text`. A search answer sets `isError: true` when no engine is `ok` or `empty`.
-  A blank query sends no engine request. The server reports `serverInfo` as `scour`.
+  the `scour search` text in `content[0].text`. A blank query or a bad `engines` list sets `isError: true` and
+  returns only the error message in `content[0].text`. A search answer sets `isError: true` when no engine is
+  `ok` or `empty`. A blank query or a bad list sends no engine request. The server reports `serverInfo` as `scour`.
 - **Local-only guard.** One `Router::layer` wraps every route, including `/mcp`, `/search`, `/status` and unknown paths. A
   request requires one `Host` header with `127.0.0.1[:port]` or `localhost[:port]`. An optional `Origin` header
   must appear at most once and use `http://127.0.0.1[:port]` or `http://localhost[:port]`. Each optional port
