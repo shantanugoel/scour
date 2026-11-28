@@ -1,15 +1,19 @@
 mod api;
 mod cli;
 mod config;
+#[cfg(test)]
+mod daemon_tests;
 mod engines;
 mod limits;
 mod mcp;
 mod search;
 
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use axum::{Router, serve::Serve};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 
@@ -39,41 +43,43 @@ async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve { config } => serve(config).await,
         Command::Search { query } => cli::search(&query).await,
-        Command::Status => cli::status().await,
+        Command::Status => cli::status(api::ADDR).await,
     }
 }
 
 async fn serve(config_path: Option<PathBuf>) -> ExitCode {
-    let config = match config::load(config_path.as_deref()) {
-        Ok(config) => config,
+    let server = match start_daemon(config_path.as_deref(), api::ADDR).await {
+        Ok(server) => server,
         Err(message) => {
             eprintln!("scour: {message}");
             return ExitCode::from(1);
         }
     };
-    let searcher = match search::Searcher::new(&config) {
-        Ok(searcher) => searcher,
-        Err(_) => {
-            eprintln!("scour: cannot start the search client");
-            return ExitCode::from(1);
-        }
-    };
-    let listener = match TcpListener::bind(api::ADDR).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("scour: cannot listen on {}: {err}", api::ADDR);
-            return ExitCode::from(1);
-        }
-    };
+    if let Err(err) = server.await {
+        eprintln!("scour: the server stopped: {err}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+pub(crate) async fn start_daemon(
+    config_path: Option<&Path>,
+    address: SocketAddr,
+) -> Result<Serve<TcpListener, Router, Router>, String> {
+    let config = config::load(config_path)?;
+    let searcher =
+        search::Searcher::new(&config).map_err(|_| "cannot start the search client".to_string())?;
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|err| format!("cannot listen on {address}: {err}"))?;
+    let bound_address = listener
+        .local_addr()
+        .map_err(|err| format!("cannot read the listen address: {err}"))?;
     let proxy = config
         .proxy
         .as_ref()
         .map(|url| format!(" (proxy {})", config::proxy_address(url)))
         .unwrap_or_default();
-    println!("scour: listening on http://{}{proxy}", api::ADDR);
-    if let Err(err) = axum::serve(listener, api::router(Arc::new(searcher))).await {
-        eprintln!("scour: the server stopped: {err}");
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
+    println!("scour: listening on http://{bound_address}{proxy}");
+    Ok(axum::serve(listener, api::router(Arc::new(searcher))))
 }

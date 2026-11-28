@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -29,8 +30,8 @@ pub async fn search(query: &str) -> ExitCode {
     presented.exit_code
 }
 
-pub async fn status() -> ExitCode {
-    let url = Url::parse(&format!("http://{ADDR}/status")).expect("daemon URL");
+pub async fn status(address: SocketAddr) -> ExitCode {
+    let url = Url::parse(&format!("http://{address}/status")).expect("daemon URL");
     let response: StatusResponse = match request_daemon(&url, "status request").await {
         Ok(response) => response,
         Err(line) => {
@@ -460,12 +461,12 @@ mod tests {
 
     #[tokio::test]
     async fn closed_loopback_port_tells_the_person_to_start_the_daemon() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
+        // Keep the port reserved so another test cannot listen on it.
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
             .expect("bind");
-        let address = listener.local_addr().expect("addr");
-        drop(listener);
-        assert_ne!(address.port(), ADDR.port());
+        let address = socket.local_addr().expect("addr");
         let endpoint = Url::parse(&format!("http://{address}/search?q=x")).unwrap();
         let err = request_daemon::<SearchResponse>(&endpoint, "search")
             .await

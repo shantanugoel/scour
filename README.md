@@ -148,12 +148,11 @@ Each engine still uses its normal search path and query parameters.
 
 ## Check
 
-1. Stop any running `scour serve` daemon. A config test binds to `127.0.0.1:7268`.
-2. Run the check.
+You can run the check while `scour serve` is running.
 
-   ```sh
-   scripts/check
-   ```
+```sh
+scripts/check
+```
 
 The command checks the format and runs Clippy with warnings as errors.
 It also runs the tests, which use saved pages and loopback servers.
