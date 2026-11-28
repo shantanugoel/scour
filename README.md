@@ -127,7 +127,7 @@ proxy = "http://127.0.0.1:8080"
 ```
 
 Use an `http://`, `socks5://`, or `socks5h://` URL with a host.
-The URL has no path, query, or fragment; a bare trailing `/` is allowed.
+The URL has no path, query, or fragment. You can end it with a bare `/`.
 The default ports are 80 for HTTP and 1080 for SOCKS5.
 For authentication, put the username and password before the host in the URL, with special characters percent-encoded.
 An unencoded `#`, `?`, or `/` in the password stops startup with exit code 1 and a message to percent-encode the password.
