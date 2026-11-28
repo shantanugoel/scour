@@ -23,29 +23,17 @@ fn request_url(base: &url::Url, query: &str) -> url::Url {
 
 fn read(_status: u16, body: &str) -> Page {
     let document = scraper::Html::parse_document(body);
-    let challenge = selector("form#captcha-form, .g-recaptcha");
+    let challenge = selector("form#captcha-form, #recaptcha.g-recaptcha");
     if document.select(&challenge).next().is_some() {
         return Page::Blocked;
     }
 
     let hits = parse(&document);
-    if !hits.is_empty() {
-        return Page::Results(hits);
-    }
-
-    if no_results(&document) {
-        Page::Empty
-    } else {
+    if hits.is_empty() {
         Page::ParseFailed
+    } else {
+        Page::Results(hits)
     }
-}
-
-/// Google puts this text in `#topstuff` when it found no matching pages.
-fn no_results(document: &scraper::Html) -> bool {
-    let marker = selector("#topstuff");
-    document.select(&marker).any(|node| {
-        plain_text(&node.text().collect::<String>()).contains("did not match any documents")
-    })
 }
 
 /// Organic results in page order. The short-video carousel and the question box have no title
@@ -56,7 +44,6 @@ fn parse(document: &scraper::Html) -> Vec<Hit> {
     let snippet_selector = selector(".VwiC3b");
     let cite_selector = selector("cite");
     let curl_selector = selector("[data-curl]");
-    let link_selector = selector("a[href]");
     let mut hits = Vec::new();
     for item in document.select(&item_selector) {
         let Some(title_node) = item.select(&title_selector).next() else {
@@ -70,12 +57,14 @@ fn parse(document: &scraper::Html) -> Vec<Hit> {
             .select(&curl_selector)
             .next()
             .and_then(|node| node.attr("data-curl"))
-            .map(str::to_string)
+            .and_then(|curl| url::Url::parse(curl).ok())
+            .and_then(|curl| accepted_result(&curl, SITE))
             .or_else(|| {
-                item.select(&link_selector)
-                    .next()
-                    .and_then(|link| link.attr("href"))
-                    .and_then(result_url)
+                let link = title_node
+                    .ancestors()
+                    .filter_map(scraper::ElementRef::wrap)
+                    .find(|node| node.value().name() == "a" && node.attr("href").is_some())?;
+                result_url(link.attr("href")?)
             })
         else {
             continue;
@@ -111,7 +100,11 @@ fn result_url(href: &str) -> Option<String> {
             let target = parsed.query_pairs().find(|(key, _)| key == "q")?.1;
             accepted_result(&url::Url::parse(&target).ok()?, SITE)
         }
-        "/goto" => Some(parsed.to_string()),
+        "/goto" => {
+            let target = parsed.query_pairs().find(|(key, _)| key == "url")?.1;
+            (matches!(parsed.scheme(), "http" | "https") && !target.trim().is_empty())
+                .then(|| parsed.to_string())
+        }
         _ => None,
     }
 }
@@ -119,16 +112,27 @@ fn result_url(href: &str) -> Option<String> {
 /// The host that `<cite>` shows, or nothing when it shows only a date or a count.
 fn domain_of(cite: &str) -> Option<String> {
     let first = cite.split_whitespace().next()?;
-    let host = first
-        .strip_prefix("https://")
-        .or_else(|| first.strip_prefix("http://"))
-        .unwrap_or(first)
-        .trim_end_matches(['.', ',', '·', '›']);
-    (host.contains('.')
-        && host.chars().any(|c| c.is_ascii_alphabetic())
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+    let host = match url::Url::parse(first) {
+        Ok(url) if url.scheme() == "http" || url.scheme() == "https" => url.host_str()?.to_string(),
+        _ => first.to_string(),
+    };
+    let host = host
+        .split(['/', '?', '#', '›', '·'])
+        .next()?
+        .trim_end_matches(['.', ',']);
+    let labels: Vec<_> = host.split('.').collect();
+    let top = labels.last()?;
+    (labels.len() >= 2
+        && top.len() >= 2
+        && top.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && host.len() <= 253
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }))
     .then(|| host.to_string())
 }
 
@@ -326,6 +330,63 @@ mod tests {
                 "{name}"
             );
             assert_eq!((ENGINE.read)(200, &changed), Page::ParseFailed, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_result_less_page_is_parse_failed_without_a_challenge() {
+        let page = r#"<div id="topstuff">Your search - <b>rust</b> - did not match any documents.</div>
+                      <div id="results"><div class="MjjYud"><span class="title">Changed markup</span></div></div>"#;
+        assert_eq!((ENGINE.read)(200, page), Page::ParseFailed);
+    }
+
+    #[test]
+    fn a_cite_domain_needs_a_dns_host_not_a_count_or_version() {
+        let cases = [
+            ("91.6K views", None),
+            ("v1.2", None),
+            ("U.S.", None),
+            ("-a.b", None),
+            ("https://go.dev/doc", Some("go.dev")),
+            ("www.facebook.com › page", Some("www.facebook.com")),
+        ];
+        for (cite, expected) in cases {
+            let page = format!(
+                r#"<div id="rso"><div class="MjjYud"><a href="/goto?url=target"><h3>Title</h3><cite>{cite}</cite></a></div></div>"#
+            );
+            let hits = results(&page);
+            assert_eq!(hits.len(), 1, "{cite}");
+            assert_eq!(hits[0].domain.as_deref(), expected, "{cite}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_data_curl_falls_back_to_the_title_link() {
+        for curl in [
+            "",
+            "javascript:alert(1)",
+            "google.com",
+            "https://www.google.com/search?q=rust",
+        ] {
+            let page = format!(
+                r#"<div id="rso"><div class="MjjYud"><a href="/goto?url=target"><h3>Title</h3></a><div data-curl="{curl}"></div></div></div>"#
+            );
+            let hits = results(&page);
+            assert_eq!(hits.len(), 1, "{curl:?}");
+            assert_eq!(
+                hits[0].url, "https://www.google.com/goto?url=target",
+                "{curl:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_goto_link_needs_a_non_empty_target() {
+        for href in ["/goto?url=", "/goto?url=%20&sa=U"] {
+            let page = format!(
+                r#"<div id="rso"><div class="MjjYud"><a href="{href}"><h3>Title</h3></a></div></div>"#
+            );
+            assert_eq!((ENGINE.read)(200, &page), Page::ParseFailed, "{href}");
         }
     }
 

@@ -84,7 +84,7 @@ impl Searcher {
                     .methods
                     .get(engine.name)
                     .copied()
-                    .unwrap_or(Method::Http),
+                    .unwrap_or_else(|| engine.default_method()),
                 base_url: config
                     .base_urls
                     .get(engine.name)
@@ -551,6 +551,28 @@ mod tests {
             client,
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_a_configured_method_uses_its_first_method() {
+        let searcher = Arc::new(
+            Searcher::new(
+                &Config {
+                    engines: vec![&crate::engines::google::ENGINE],
+                    ..Config::default()
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let error = searcher
+            .search_selected("rust", Some(&["google"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "google needs the browser; start scour serve with --browser"
+        );
     }
 
     async fn serve(app: axum::Router) -> &'static str {

@@ -71,6 +71,13 @@ pub struct Engine {
     pub read: fn(status: u16, body: &str) -> Page,
 }
 
+impl Engine {
+    /// The method that a bare engine name uses.
+    pub fn default_method(&self) -> Method {
+        self.methods[0]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
     Results(Vec<Hit>),

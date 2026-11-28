@@ -197,6 +197,20 @@ mod tests {
         daily: 200,
     };
 
+    #[test]
+    fn a_result_without_a_domain_has_no_domain_key_in_json() {
+        let item = ResultItem {
+            url: "https://tokio.rs/".to_string(),
+            title: "Tokio".to_string(),
+            content: String::new(),
+            domain: None,
+            engine: "google".to_string(),
+            position: 1,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains(r#""domain""#), "{json}");
+    }
+
     async fn serve(app: axum::Router) -> (&'static str, SocketAddr) {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await

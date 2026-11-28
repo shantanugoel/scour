@@ -212,7 +212,7 @@ fn select_engines(
                 ));
             }
             Some(method) => method,
-            None => engine.methods[0],
+            None => engine.default_method(),
         };
         method.check_available(&item, browser)?;
         methods.insert(engine.name, method);

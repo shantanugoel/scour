@@ -51,7 +51,8 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
    ```
 
 `scour search` prints the results that the engines return. With only DuckDuckGo enabled, its saved page gives 10 results.
-Each result has a title, a URL and a snippet. A Google result also has an optional `domain`: the host from `<cite>`.
+Each result has a title, a URL and a snippet. In the JSON answer, a Google result also has an optional `domain` field:
+the host from `<cite>`. The CLI and MCP text do not show it.
 The URL of a Google web result is the Google redirect. The URL of a Google video card is the video address.
 
 When several engines are enabled, the daemon queries them in parallel. A query with `--engines` asks only the
@@ -63,10 +64,10 @@ It keeps the first occurrence of each exact URL and numbers the merged results f
 | State | Meaning |
 | --- | --- |
 | `ok` | The engine returned results. |
-| `empty` | DuckDuckGo or Google showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
+| `empty` | DuckDuckGo showed its no-results marker, or Bing returned HTTP 200 with no recognized results. |
 | `blocked` | The engine is resting, returned HTTP 403 or 429, DuckDuckGo showed a challenge page, or Google showed its `/sorry/` page. |
 | `limited` | The engine reached its daily limit, or its next pace slot is more than 30 seconds or one refill interval away. |
-| `parse_failed` | DuckDuckGo or Google returned HTTP 200 with neither recognized results nor a no-results marker. |
+| `parse_failed` | DuckDuckGo returned HTTP 200 with neither recognized results nor a no-results marker. Google returned HTTP 200 without a challenge or results. |
 | `error` | The request failed, timed out, or returned another non-200 status without a recognized challenge. |
 
 The CLI prints results and `ok` or `empty` summaries to stdout. It prints `blocked`, `limited`, `parse_failed` and `error` to stderr.
@@ -74,7 +75,7 @@ If no engine returns `ok` or `empty`, stdout is empty and the CLI exits with cod
 Each summary line starts with `name@method`, for example `duckduckgo@http: ok (8 results) (1/100 daily)`.
 
 A bad `engines` list stops the query with HTTP 400 (MCP `isError: true`), and no engine request goes out.
-The message names the item. A bad list has an unknown name, an engine that is not enabled, a duplicate name,
+The message names the item. A bad list has an unknown name, an engine that is not enabled, `google@http`, a duplicate name,
 an empty list, or an unknown method. An `@browser` item requires `scour serve --browser`.
 
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
@@ -102,6 +103,13 @@ When a deadline appears, `scour status` also prints the remaining time.
 ### Run with Chrome
 
 Install Chrome or Chromium and put `Xvfb` on `PATH`. Set `CHROME` to the executable path to choose a specific Chrome.
+The default config does not enable Google. Add it to the config file that the daemon reads:
+
+```toml
+engines = ["duckduckgo", "google"]
+```
+
+Then start the daemon with the browser and run the queries:
 
 ```sh
 ./target/release/scour serve --browser
@@ -111,9 +119,9 @@ Install Chrome or Chromium and put `Xvfb` on `PATH`. Set `CHROME` to the executa
 ```
 
 Google only uses the browser. A bare `google` item is the browser method, and `google@http` is a bad item.
-A Google web result URL is the absolute `/goto?url=` redirect. Spike #37 found no free source for the target URL,
-so owner decision B keeps the redirect. A `/url?q=<target>` link uses the plain target, because it needs no extra
-request. A video card uses its exact `data-curl` URL. Each result has `domain` when `<cite>` shows a host.
+A Google web result URL is the absolute `/goto?url=` redirect, because the result page gives no free target URL.
+A `/url?q=<target>` link uses the plain target, because it needs no extra request. A video card uses its exact
+`data-curl` URL when that is an http(s) URL on another site. Each result has `domain` when `<cite>` shows a host.
 The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`.
 
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
