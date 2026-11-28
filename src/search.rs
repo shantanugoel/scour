@@ -70,6 +70,11 @@ impl Searcher {
         Ok(Self::with_client(config, client, browser))
     }
 
+    pub fn with_browser(mut self, browser: Option<Browser>) -> Self {
+        self.browser = browser;
+        self
+    }
+
     fn with_client(config: &Config, client: wreq::Client, browser: Option<Browser>) -> Self {
         let engines = config
             .engines

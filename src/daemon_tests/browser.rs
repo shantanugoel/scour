@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
@@ -338,6 +338,52 @@ async fn idle_browser_stop_removes_the_profile_and_starts_a_new_chrome() {
 }
 
 #[tokio::test]
+async fn a_chrome_crash_during_a_busy_query_ends_the_session() {
+    let _displays = DISPLAYS.lock().await;
+    let (engine, requests) = slow_fixture_server().await;
+    let mut daemon = TestDaemon::start_idle('u', "duckduckgo@browser", engine, 0, None, 8).await;
+    let request = tokio::spawn(search(daemon.address, None));
+    let run = poll("the browser to start", Duration::from_secs(15), || {
+        fs::read_dir(daemon.browser_root())
+            .ok()?
+            .next()?
+            .ok()
+            .map(|entry| entry.path())
+    })
+    .await;
+    let chrome = poll("Chrome to start", Duration::from_secs(15), || {
+        browser_pid(&run)
+    })
+    .await;
+    let (_, group, display, xvfb) = browser_process(&run);
+    poll("the slow page request", Duration::from_secs(15), || {
+        (requests.load(Ordering::Relaxed) > 0).then_some(())
+    })
+    .await;
+    // The idle deadline passes while the slow query holds the CDP client.
+    sleep(Duration::from_secs(9)).await;
+    assert!(
+        !request.is_finished(),
+        "the query finished before the crash"
+    );
+    assert_eq!(unsafe { libc::kill(chrome, libc::SIGKILL) }, 0);
+    poll("the busy crash cleanup", Duration::from_secs(5), || {
+        fs::read_dir(daemon.browser_root())
+            .unwrap()
+            .next()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(!run.exists(), "{}", run.display());
+    wait_stopped(group, xvfb, &display).await;
+    request.abort();
+
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
+#[tokio::test]
 async fn chrome_crash_ends_the_session_and_the_next_query_starts_chrome() {
     let _displays = DISPLAYS.lock().await;
     let engine = fixture_server().await;
@@ -363,12 +409,8 @@ async fn chrome_crash_ends_the_session_and_the_next_query_starts_chrome() {
     assert_ne!(crashed, run);
     let (chrome, _, _, _) = browser_process(&crashed);
     assert_eq!(unsafe { libc::kill(chrome, libc::SIGKILL) }, 0);
-    // SIGKILL takes effect at the next scheduling point; wait for that, not for the idle time.
-    poll("Chrome to die", Duration::from_secs(5), || {
-        (!Path::new(&format!("/proc/{chrome}")).exists()).then_some(())
-    })
-    .await;
-    // A query waits for the teardown under the lock, then starts a new Chrome.
+    // The query can arrive before try_wait sees the exit. It must end that session and start one
+    // new session, not fail with the closed CDP connection.
     assert_rendered(daemon.search(None).await);
     assert!(!crashed.exists(), "{}", crashed.display());
     assert_ne!(daemon.run_dir(), crashed);
@@ -381,7 +423,7 @@ async fn chrome_crash_ends_the_session_and_the_next_query_starts_chrome() {
 async fn a_second_daemon_cannot_use_a_running_browser_root() {
     let _displays = DISPLAYS.lock().await;
     let engine = fixture_server().await;
-    let mut daemon = TestDaemon::start('l', "duckduckgo@browser", engine, 0, None).await;
+    let mut daemon = TestDaemon::start('d', "duckduckgo@browser", engine, 0, None).await;
     assert_rendered(daemon.search(None).await);
     let run = daemon.run_dir();
 
@@ -450,7 +492,7 @@ async fn daemon_kill_stops_its_browser_and_the_next_start_cleans_the_root() {
     daemon.assert_empty_root();
     assert!(
         !Path::new(&lock).exists(),
-        "the start-up cleanup removed the X lock"
+        "the start-up cleanup did not remove the X lock"
     );
     assert_inodes(&before);
     daemon.stop(libc::SIGTERM).await;
@@ -477,10 +519,38 @@ async fn daemon_kill_stops_its_browser_and_the_next_start_cleans_the_root() {
     daemon.assert_empty_root();
     assert!(
         !Path::new(&lock).exists(),
-        "the start-up cleanup removed the X lock"
+        "the start-up cleanup did not remove the X lock"
     );
     assert_inodes(&before);
     daemon.stop(libc::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn a_symlinked_browser_root_exits_one_and_keeps_the_target() {
+    let root = PathBuf::from(format!("/tmp/s{:x}symlink", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("config.toml"), "engines = [\"duckduckgo\"]\n").unwrap();
+    let target = root.join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep"), "fixture").unwrap();
+    let link = root.join("b");
+    symlink(&target, &link).unwrap();
+
+    let error = start_daemon(
+        Some(&root.join("config.toml")),
+        (Ipv4Addr::LOCALHOST, 0).into(),
+        Some(BrowserSettings {
+            cdp_port: 0,
+            root: link,
+        }),
+    )
+    .await
+    .err()
+    .expect("a symlinked browser root must not start");
+    assert!(error.contains("is not a directory of this user"), "{error}");
+    assert_eq!(fs::read_to_string(target.join("keep")).unwrap(), "fixture");
+    fs::remove_dir_all(&root).unwrap();
 }
 
 struct TestDaemon {
@@ -800,6 +870,26 @@ async fn fixture_server() -> SocketAddr {
     .await
 }
 
+async fn slow_fixture_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let address = serve(Router::new().route(
+        "/html/",
+        get(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            async {
+                sleep(Duration::from_secs(30)).await;
+                (
+                    [(header::CACHE_CONTROL, "public, max-age=600")],
+                    Html(FIXTURE),
+                )
+            }
+        }),
+    ))
+    .await;
+    (address, requests)
+}
+
 async fn serve(app: Router) -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -937,9 +1027,8 @@ fn assert_inodes(before: &BTreeMap<PathBuf, u64>) {
     }
 }
 
-#[track_caller]
-fn find_pid(matches: impl Fn(&[&str]) -> bool) -> i32 {
-    for entry in fs::read_dir("/proc").unwrap().flatten() {
+fn find_pid_opt(matches: impl Fn(&[&str]) -> bool) -> Option<i32> {
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse() else {
             continue;
         };
@@ -952,10 +1041,22 @@ fn find_pid(matches: impl Fn(&[&str]) -> bool) -> i32 {
             .filter(|arg| !arg.is_empty())
             .collect();
         if matches(&args) {
-            return pid;
+            return Some(pid);
         }
     }
-    panic!("could not find the running browser or Xvfb process");
+    None
+}
+
+#[track_caller]
+fn find_pid(matches: impl Fn(&[&str]) -> bool) -> i32 {
+    find_pid_opt(matches).expect("could not find the running browser or Xvfb process")
+}
+
+fn browser_pid(run: &Path) -> Option<i32> {
+    let profile = format!("--user-data-dir={}", run.join("profile").display());
+    find_pid_opt(|args| {
+        args.contains(&profile.as_str()) && !args.iter().any(|arg| arg.starts_with("--type="))
+    })
 }
 
 #[track_caller]

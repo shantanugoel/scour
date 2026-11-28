@@ -3,6 +3,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -88,39 +89,55 @@ impl Browser {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Rendered, String> {
-        let cdp = {
-            let mut state = self.state.clone().lock_owned().await;
-            if let State::Running(session) = &mut *state
-                && session.chrome_exited()
-            {
-                end(state, State::Idle).await;
-                state = self.state.clone().lock_owned().await;
-            }
-            if matches!(*state, State::Idle) {
-                let session =
-                    Session::start(&self.settings, Arc::downgrade(&self.state), self.idle).await?;
-                *state = State::Running(session);
-            }
-            match &mut *state {
-                State::Running(session) => {
-                    session.last_used = Instant::now();
-                    session.cdp.clone()
-                }
-                State::Stopped => return Err("the browser is stopping".into()),
-                State::Idle => unreachable!(),
-            }
-        };
         let host = url.host_str().unwrap_or("the engine");
         let slow = || format!("no answer from {host} in {} s", TIMEOUT.as_secs());
         let cdp_error = |err| match err {
             CdpError::Timeout => slow(),
             _ => "lost the connection to Chrome".into(),
         };
-        let deadline = Instant::now() + TIMEOUT;
-        let page = timeout_at(deadline, cdp.new_page("about:blank"))
-            .await
-            .map_err(|_| slow())?
-            .map_err(cdp_error)?;
+        let mut retried = false;
+        let (_cdp, page, deadline) = loop {
+            let (cdp, started) = {
+                let mut state = self.state.clone().lock_owned().await;
+                if let State::Running(session) = &mut *state
+                    && session.chrome_exited()
+                {
+                    end(state, State::Idle).await;
+                    state = self.state.clone().lock_owned().await;
+                }
+                let started = matches!(*state, State::Idle);
+                if started {
+                    let session =
+                        Session::start(&self.settings, Arc::downgrade(&self.state), self.idle)
+                            .await?;
+                    *state = State::Running(session);
+                }
+                match &mut *state {
+                    State::Running(session) => {
+                        session.last_used = Instant::now();
+                        (session.cdp.clone(), started)
+                    }
+                    State::Stopped => return Err("the browser is stopping".into()),
+                    State::Idle => unreachable!(),
+                }
+            };
+            let deadline = Instant::now() + TIMEOUT;
+            match timeout_at(deadline, cdp.new_page("about:blank")).await {
+                Ok(Ok(page)) => break (cdp, page, deadline),
+                Err(_) | Ok(Err(CdpError::Timeout)) => return Err(slow()),
+                Ok(Err(err)) if started || retried => return Err(cdp_error(err)),
+                Ok(Err(_)) => {
+                    // Chrome can close CDP before try_wait sees its exit. End that session if it
+                    // is still there and open one new session; an error on the new session is final.
+                    let state = self.state.clone().lock_owned().await;
+                    if matches!(&*state, State::Running(session) if Arc::ptr_eq(&session.cdp, &cdp))
+                    {
+                        end(state, State::Idle).await;
+                    }
+                    retried = true;
+                }
+            }
+        };
         let rendered = timeout_at(deadline, async {
             page.goto(url.as_str()).await.map_err(|err| match err {
                 CdpError::ChromeMessage(_) => format!("cannot connect to {host}"),
@@ -280,7 +297,12 @@ async fn supervise(
             let state = browser.lock().await;
             match &*state {
                 State::Running(session) if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp)) => {
-                    session.last_used + idle
+                    if session.busy() {
+                        // A query holds the CDP client. Check again after another idle time.
+                        Instant::now() + idle
+                    } else {
+                        session.last_used + idle
+                    }
                 }
                 _ => return,
             }
@@ -305,15 +327,8 @@ async fn supervise(
                 match &*guard {
                     State::Running(session)
                         if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp))
-                            && session.busy() =>
-                    {
-                        drop(guard);
-                        sleep_until(Instant::now() + idle).await;
-                        continue;
-                    }
-                    State::Running(session)
-                        if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp))
-                            && session.last_used + idle > Instant::now() =>
+                            && (session.busy()
+                                || session.last_used + idle > Instant::now()) =>
                     {
                         drop(guard);
                         continue;
@@ -354,15 +369,26 @@ fn open_root(path: &Path) -> Result<File, String> {
             ));
         }
     }
-    let meta = fs::symlink_metadata(path)
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| match err.raw_os_error() {
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => format!(
+                "cannot use {}: it is not a directory of this user",
+                path.display()
+            ),
+            _ => format!("cannot use {}: {err}", path.display()),
+        })?;
+    let meta = root
+        .metadata()
         .map_err(|err| format!("cannot use {}: {err}", path.display()))?;
-    if !meta.file_type().is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
         return Err(format!(
             "cannot use {}: it is not a directory of this user",
             path.display()
         ));
     }
-    let root = File::open(path).map_err(|err| format!("cannot use {}: {err}", path.display()))?;
     match root.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -375,16 +401,17 @@ fn open_root(path: &Path) -> Result<File, String> {
             return Err(format!("cannot lock {}: {err}", path.display()));
         }
     }
-    clean_root(path)?;
+    clean_root(&root, path)?;
     Ok(root)
 }
 
-fn clean_root(root: &Path) -> Result<(), String> {
+fn clean_root(root: &File, path: &Path) -> Result<(), String> {
+    // Read and remove through the locked descriptor, so a renamed root path cannot redirect us.
+    let opened = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
     let entries =
-        fs::read_dir(root).map_err(|err| format!("cannot read {}: {err}", root.display()))?;
+        fs::read_dir(&opened).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|err| format!("cannot read {}: {err}", root.display()))?;
-        let path = entry.path();
+        let entry = entry.map_err(|err| format!("cannot read {}: {err}", path.display()))?;
         let name = entry.file_name();
         if let Some(pid) = name
             .to_string_lossy()
@@ -394,7 +421,7 @@ fn clean_root(root: &Path) -> Result<(), String> {
         {
             remove_x_locks(pid);
         }
-        remove_entry(&path)?;
+        remove_entry(&entry.path(), &path.join(&name))?;
     }
     Ok(())
 }
@@ -411,22 +438,37 @@ fn remove_x_locks(pid: libc::pid_t) {
     let owner = format!("{pid:>10}\n");
     for n in 0..100 {
         let path = format!("/tmp/.X{n}-lock");
-        if fs::read_to_string(&path).is_ok_and(|text| text == owner) {
+        if read_lock(Path::new(&path)).is_some_and(|text| text == owner) {
             let _ = fs::remove_file(path);
         }
     }
 }
 
-fn remove_entry(path: &Path) -> Result<(), String> {
-    let meta = match fs::symlink_metadata(path) {
+fn read_lock(path: &Path) -> Option<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(64).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+fn remove_entry(entry: &Path, path: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(entry) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(format!("cannot delete {}: {err}", path.display())),
     };
     let result = if meta.file_type().is_dir() {
-        fs::remove_dir_all(path)
+        fs::remove_dir_all(entry)
     } else {
-        fs::remove_file(path)
+        fs::remove_file(entry)
     };
     result.map_err(|err| format!("cannot delete {}: {err}", path.display()))
 }
@@ -522,7 +564,7 @@ impl Group {
         // runtime thread: `main` keeps the current_thread runtime, and pool threads retire.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, stop_signal) == -1 {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, stop_signal as libc::c_ulong) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::getppid() != parent {

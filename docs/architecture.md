@@ -67,7 +67,10 @@ flowchart LR
 - One supervisor task for each Chrome session ends the session when Chrome exits or when
   `[browser] idle_seconds` passes without a query. The default is 5400 seconds (90 minutes); the range is
   1 to 86400. A query that holds the CDP client makes the session busy, so the supervisor checks again later.
+  The deferred check stays in the supervisor's `select!`, so a Chrome crash still ends the session at once.
   The run directory and profile go away on both paths.
+- A query that reuses a running session and loses CDP while it opens its page ends that session and starts
+  one new session. An error on the new session, or any error after navigation starts, is final.
 - `Group::spawn` sets `PR_SET_PDEATHSIG` in `pre_exec`. Chrome gets SIGKILL and Xvfb gets SIGTERM when the daemon
   dies. The signal fires when the spawning thread exits, so the daemon spawns children only on the runtime thread;
   `main` keeps the `current_thread` runtime.
@@ -266,12 +269,15 @@ flowchart LR
   small. Chrome is not available as a library. We did not link a V8 browser such as Obscura, because V8 makes the
   binary approximately 70 MB, a V8 crash stops the daemon, and Obscura got no Google results.
 - **One locked browser root for each user.** The root is `/dev/shm/scour-<uid>`, and the daemon takes a `flock`
-  on it after the bind. This gives six results. (1) The kernel frees the lock at any death, so a new daemon can
-  clean after `kill -9`. (2) `PR_SET_PDEATHSIG` fires when the spawning thread exits, so children start only on
-  the runtime thread. (3) `/dev/shm` is tmpfs on systemd hosts and in Docker; `/tmp` is not always. (4) `end`
-  drops the old session under the lock, so a query waits for a teardown and does not overlap it. (5) The Docker
-  shim's watcher outlives `stop`, so it can remove a container that an in-flight create adds. (6) The root must
-  be a real directory of this user, because the cleanup deletes every entry.
+  on it after the bind. This gives three results. (1) The kernel frees the lock at any death, so a new daemon
+  can clean after `kill -9`. (2) `/dev/shm` is tmpfs on systemd hosts and in Docker; `/tmp` is not always.
+  (3) The root must be a real directory of this user, because the cleanup deletes every entry. The daemon opens
+  it with `O_DIRECTORY | O_NOFOLLOW`, checks its owner with `fstat`, and reads and removes entries through the
+  locked descriptor, so a swapped path cannot redirect the cleanup.
+- **A teardown completes before a new session starts.** (1) `PR_SET_PDEATHSIG` fires when the spawning thread
+  exits, so children start only on the runtime thread. (2) `end` drops the old session under the lock, so a query
+  waits for a teardown and does not overlap it. (3) The Docker shim's watcher outlives `stop`, so it can remove
+  a container that an in-flight create adds.
 - **Cheap HTTP engines by default, Google opt-in.** DuckDuckGo answered each paced query in a median time of
   approximately 0.7 s. Google gave no results to raw HTTP or to replayed browser cookies. We did not use the browser
   for all engines, because headful Chrome on Xvfb used a peak PSS of 696 MiB and an idle PSS of 551 MiB (#32),

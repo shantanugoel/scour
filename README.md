@@ -127,8 +127,8 @@ The `/sorry/` page gives `blocked`, and changed result markup gives `parse_faile
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
 A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
 The daemon keeps the temporary profile in `/dev/shm/scour-<uid>`, a memory-backed directory with mode `0700`.
-It deletes everything in that directory at start. This also needs no deep `TMPDIR`, because Chrome's
-Unix socket path has a length limit.
+Each Chrome session uses the short run directory `<root>/<pid>-<nanos>` for its profile and `TMPDIR`, because
+Chrome's Unix socket path has a length limit. The daemon deletes everything in the root at start.
 The daemon stops Chrome and Xvfb after 90 minutes without a browser query. Set `[browser] idle_seconds` to
 change this time. A `kill -9` of the daemon also stops Chrome and Xvfb. The next `scour serve --browser`
 deletes the left-over profile before the first query. Stop the daemon with Ctrl-C or SIGTERM to close Chrome
