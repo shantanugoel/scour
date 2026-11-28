@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use crate::api::EngineState;
 
 const MAX_REST: Duration = Duration::from_secs(4 * 60 * 60);
-// A 30 s pace wait plus the 10 s engine timeout fits within the 45 s CLI wait.
+// A 30 s pace wait plus the 10 s engine timeout fits within QUERY_BUDGET.
 const MAX_PACE_WAIT: Duration = Duration::from_secs(30);
 const DAILY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -88,12 +88,16 @@ impl Limits {
         reservation: (Instant, DateTime<Utc>),
     ) -> Option<DateTime<Utc>> {
         let ready_at = self.active_rest(now)?;
+        self.release(reservation);
+        self.last_state = Some(EngineState::Blocked);
+        Some(ready_at)
+    }
+
+    pub fn release(&mut self, reservation: (Instant, DateTime<Utc>)) {
         // A delayed task can wake after another request has already reserved a newer slot.
         if let Some(index) = self.daily.iter().rposition(|entry| *entry == reservation) {
             self.daily.remove(index);
         }
-        self.last_state = Some(EngineState::Blocked);
-        Some(ready_at)
     }
 
     pub fn peek(&self, now: Instant) -> Option<DateTime<Utc>> {
@@ -184,6 +188,22 @@ mod tests {
         refill: Duration::from_secs(30),
         daily: 200,
     };
+
+    #[test]
+    fn releasing_an_unsent_request_refunds_its_daily_reservation() {
+        let settings = LimitSettings {
+            burst: 1,
+            ..LimitSettings::default()
+        };
+        let mut limits = Limits::new(Duration::from_secs(600), settings);
+        let now = Instant::now();
+        let wall = Utc::now();
+        assert!(matches!(limits.admit(now, wall), Admit::SendAt(at) if at == now));
+        assert_eq!(limits.daily_count(now), 1);
+        limits.release((now, wall));
+        assert_eq!(limits.daily_count(now), 0);
+        assert!(matches!(limits.admit(now, wall), Admit::Limited(_)));
+    }
 
     #[tokio::test]
     async fn only_one_caller_can_reserve_the_next_pace_slot() {

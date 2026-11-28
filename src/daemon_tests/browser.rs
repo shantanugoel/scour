@@ -11,17 +11,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
+use axum::extract::Query;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use url::Url;
 
-use crate::api::{EngineState, SearchResponse};
-use crate::browser::BrowserSettings;
+use crate::api::{EngineState, SearchResponse, StatusResponse};
+use crate::browser::{Browser, BrowserSettings, TABS};
 use crate::engines::Method;
 use crate::{cli, start_daemon};
 
@@ -29,6 +30,7 @@ const CHILD_ROOT: &str = "SCOUR_TEST_BROWSER_ROOT";
 const CHILD_PORT: &str = "SCOUR_TEST_CDP_PORT";
 const CHILD_ENDPOINT: &str = "SCOUR_TEST_CDP_ENDPOINT";
 const QUERY: &str = "scour-query-fixture-v6xM43sw";
+const HUNG_QUERY: &str = "hung-page";
 const TITLE: &str = "scour-result-fixture-B7zA55tj";
 const FIXTURE: &str = r#"<!doctype html><body>
 <script>
@@ -38,6 +40,208 @@ document.body.insertAdjacentHTML('beforeend',
 
 // A test that snapshots X paths must see a stable set of other test displays.
 static DISPLAYS: Mutex<()> = Mutex::const_new(());
+
+#[tokio::test]
+async fn concurrent_browser_queries_wait_for_free_tabs() {
+    let _displays = DISPLAYS.lock().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let engine = serve(Router::new().route(
+        "/html/",
+        get({
+            let peak = peak.clone();
+            move || {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let count = active.fetch_add(1, Ordering::Relaxed) + 1;
+                    peak.fetch_max(count, Ordering::Relaxed);
+                    sleep(Duration::from_secs(1)).await;
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    Html(FIXTURE)
+                }
+            }
+        }),
+    ))
+    .await;
+    let mut daemon = TestDaemon::start_url(
+        'j',
+        "duckduckgo",
+        format!("http://{engine}"),
+        StartOptions {
+            extra: Some("[limits]\nburst = 10"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let queries = (0..TABS + 2).map(|index| {
+        let address = daemon.address;
+        async move {
+            search_query(
+                address,
+                &format!("page {index}"),
+                Some("duckduckgo@browser"),
+            )
+            .await
+        }
+    });
+    for answer in futures::future::join_all(queries).await {
+        assert_rendered(answer);
+    }
+    let peak = peak.load(Ordering::Relaxed);
+    assert!((2..=TABS).contains(&peak), "{peak} concurrent requests");
+    daemon.stop(libc::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn a_full_browser_returns_an_error_at_the_tab_wait_deadline() {
+    let _displays = DISPLAYS.lock().await;
+    let (engine, requests) = budget_fixture_server().await;
+    let url = Url::parse(&format!("http://{engine}/html/?q={HUNG_QUERY}")).unwrap();
+    let root = PathBuf::from(format!("/tmp/s{:x}tab", std::process::id()));
+    let browser = Browser::open(
+        BrowserSettings {
+            cdp_port: 0,
+            root: root.clone(),
+        },
+        Duration::from_secs(90),
+        None,
+    )
+    .unwrap();
+    let hold_tabs = futures::future::join_all((0..TABS).map(|index| {
+        let browser = &browser;
+        let mut url = url.clone();
+        url.query_pairs_mut().append_pair("tab", &index.to_string());
+        async move {
+            let tab = browser
+                .open_tab(Instant::now() + Duration::from_secs(20))
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.message(&url)));
+            tab.render(&url).await
+        }
+    }));
+    let wait_for_tab = async {
+        poll("all page requests", Duration::from_secs(15), || {
+            (requests.load(Ordering::Relaxed) == TABS).then_some(())
+        })
+        .await;
+        let now = Instant::now();
+        let result = browser.open_tab(now + Duration::from_secs(2)).await;
+        (result, now.elapsed())
+    };
+    let (_, (result, elapsed)) = tokio::join!(hold_tabs, wait_for_tab);
+    let error = result.err().map(|error| error.message(&url));
+    browser.stop().await;
+    drop(browser);
+    fs::remove_dir(root).unwrap();
+    assert_eq!(
+        error.as_deref(),
+        Some("all 4 browser tabs stayed busy for 2 s")
+    );
+    assert!(
+        (Duration::from_secs(2)..Duration::from_secs(3)).contains(&elapsed),
+        "tab wait took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hung_browser_page_times_out_and_closes_its_target() {
+    let _displays = DISPLAYS.lock().await;
+    let (engine, _) = budget_fixture_server().await;
+    let mut daemon = TestDaemon::start('k', "duckduckgo@browser", engine, 0, None).await;
+    assert_eq!(daemon.search(None).await.engines[0].state, EngineState::Ok);
+    let active_port =
+        fs::read_to_string(daemon.run_dir().join("profile/DevToolsActivePort")).unwrap();
+    let targets = format!(
+        "http://127.0.0.1:{}/json/list",
+        active_port.lines().next().unwrap()
+    );
+    let client = wreq::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let pages = || async {
+        let targets: Vec<serde_json::Value> = client
+            .get(&targets)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        targets
+            .into_iter()
+            .filter(|target| target["type"] == "page")
+            .map(|target| target["id"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let before = pages().await;
+    let answer = search_query(daemon.address, HUNG_QUERY, None).await;
+    assert_eq!(answer.engines[0].state, EngineState::Error, "{answer:?}");
+    assert_eq!(
+        answer.engines[0].error.as_deref(),
+        Some("no answer from 127.0.0.1 in 10 s")
+    );
+    assert_eq!(answer.engines[0].daily_count, 2);
+    timeout(Duration::from_secs(5), async {
+        while pages().await != before {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the timed-out page target should close");
+    daemon.stop(libc::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn a_paced_browser_query_reports_a_page_timeout_before_the_cli_timeout() {
+    let _displays = DISPLAYS.lock().await;
+    let (engine, requests) = budget_fixture_server().await;
+    let mut daemon = TestDaemon::start_url(
+        'm',
+        "duckduckgo",
+        format!("http://{engine}"),
+        StartOptions {
+            extra: Some("[limits]\nburst = 1\nrefill_seconds = 30"),
+            chrome_delay_seconds: Some(7),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(daemon.search(None).await.engines[0].state, EngineState::Ok);
+    let now = Instant::now();
+    let query = cli::search(daemon.address, HUNG_QUERY, Some("duckduckgo@browser"));
+    let sent = async {
+        poll("the paced page request", Duration::from_secs(40), || {
+            (requests.load(Ordering::Relaxed) == 1).then_some(now.elapsed())
+        })
+        .await
+    };
+    let (exit, sent_at) = tokio::join!(query, sent);
+    let elapsed = now.elapsed();
+    let status: StatusResponse = wreq::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+        .get(format!("http://{}/status", daemon.address))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exit, ExitCode::from(1));
+    assert_eq!(status.engines[0].last_state, Some(EngineState::Error));
+    assert_eq!(status.engines[0].daily_count, 2);
+    assert!(sent_at >= Duration::from_secs(35), "sent at {sent_at:?}");
+    assert!(
+        (Duration::from_secs(38)..Duration::from_secs(45)).contains(&elapsed),
+        "CLI returned after {elapsed:?}"
+    );
+    daemon.stop(libc::SIGTERM).await;
+}
 
 #[tokio::test]
 async fn browser_selections_render_without_storing_queries_or_results() {
@@ -725,6 +929,7 @@ struct StartOptions<'a> {
     endpoint: Option<&'a str>,
     idle: Option<u32>,
     extra: Option<&'a str>,
+    chrome_delay_seconds: Option<u32>,
 }
 
 impl TestDaemon {
@@ -779,6 +984,7 @@ impl TestDaemon {
             endpoint,
             idle,
             extra,
+            chrome_delay_seconds,
         }: StartOptions<'_>,
     ) -> Self {
         // Chrome builds a Unix socket path under TMPDIR, which must fit in sun_path.
@@ -797,19 +1003,25 @@ impl TestDaemon {
             ),
         )
         .unwrap();
-        if endpoint.is_some() {
-            let chrome = root.join("chrome");
-            fs::write(
-                &chrome,
+        let chrome_script = if endpoint.is_some() {
+            Some(
                 r#"#!/bin/sh
 cd "$SCOUR_TEST_BROWSER_ROOT" || exit 1
 printf '%s %s\n' "$$" "$DISPLAY" > fake
 while [ ! -f announce ]; do sleep 0.05; done
 printf 'DevTools listening on %s\n' "$SCOUR_TEST_CDP_ENDPOINT" >&2
 exec sleep 60
-"#,
+"#
+                .to_owned(),
             )
-            .unwrap();
+        } else {
+            chrome_delay_seconds.map(|seconds| {
+                format!("#!/bin/sh\nsleep {seconds}\nexec \"$SCOUR_TEST_REAL_CHROME\" \"$@\"\n")
+            })
+        };
+        if let Some(script) = chrome_script {
+            let chrome = root.join("chrome");
+            fs::write(&chrome, script).unwrap();
             fs::set_permissions(&chrome, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let child = Self::command(&root, port, endpoint).spawn().unwrap();
@@ -833,6 +1045,17 @@ exec sleep 60
             command
                 .env("CHROME", root.join("chrome"))
                 .env(CHILD_ENDPOINT, endpoint);
+        } else if root.join("chrome").is_file() {
+            let executable = chromiumoxide::detection::default_executable(
+                chromiumoxide::detection::DetectionOptions {
+                    msedge: false,
+                    unstable: false,
+                },
+            )
+            .expect("Chrome for the delayed start");
+            command
+                .env("CHROME", root.join("chrome"))
+                .env("SCOUR_TEST_REAL_CHROME", executable);
         }
         command
     }
@@ -1013,8 +1236,12 @@ async fn poll<T>(what: &str, limit: Duration, mut ready: impl FnMut() -> Option<
 }
 
 async fn search(address: SocketAddr, selection: Option<&str>) -> SearchResponse {
+    search_query(address, QUERY, selection).await
+}
+
+async fn search_query(address: SocketAddr, query: &str, selection: Option<&str>) -> SearchResponse {
     let mut url = Url::parse(&format!("http://{address}/search")).unwrap();
-    url.query_pairs_mut().append_pair("q", QUERY);
+    url.query_pairs_mut().append_pair("q", query);
     if let Some(selection) = selection {
         url.query_pairs_mut().append_pair("engines", selection);
     }
@@ -1043,6 +1270,27 @@ async fn fixture_server() -> SocketAddr {
         }),
     ))
     .await
+}
+
+async fn budget_fixture_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let address = serve(Router::new().route(
+        "/html/",
+        get(move |Query(query): Query<BTreeMap<String, String>>| {
+            let count = count.clone();
+            async move {
+                if query.get("q").is_some_and(|query| query == HUNG_QUERY) {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    std::future::pending().await
+                } else {
+                    Html("<div class=\"result\"><a class=\"result__a\" href=\"https://example.test/\">fixture</a></div>")
+                }
+            }
+        }),
+    ))
+    .await;
+    (address, requests)
 }
 
 async fn slow_fixture_server() -> (SocketAddr, Arc<AtomicUsize>) {
@@ -1424,7 +1672,7 @@ fn assert_start_failure(response: SearchResponse, error: &str) {
         "{response:?}"
     );
     assert_eq!(response.engines[0].error.as_deref(), Some(error));
-    assert_eq!(response.engines[0].daily_count, 1);
+    assert_eq!(response.engines[0].daily_count, 0);
 }
 
 fn assert_no_query_data(root: &Path) {

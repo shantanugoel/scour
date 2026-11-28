@@ -7,18 +7,19 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as SyncMutex, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chromiumoxide::Browser as CdpBrowser;
+use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
 use chromiumoxide::detection::{DetectionOptions, default_executable};
 use chromiumoxide::error::CdpError;
 use chromiumoxide::handler::HandlerConfig;
+use chromiumoxide::{Browser as CdpBrowser, Page};
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
-use tokio::task::JoinSet;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use url::Url;
 
@@ -26,6 +27,10 @@ use crate::search::TIMEOUT;
 use crate::socks::Forwarder;
 
 pub const CDP_PORT: u16 = 7269;
+pub const TABS: usize = 4;
+const STARTING: &str = "Chrome is still starting; search again in a few seconds";
+const STOPPING: &str = "the browser is stopping";
+const LOST_CHROME: &str = "lost the connection to Chrome";
 const POLL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const XVFB_START: Duration = Duration::from_secs(30);
@@ -33,6 +38,7 @@ const CHROME_START: Duration = Duration::from_secs(30);
 // Chrome appends this to TMPDIR, and sun_path holds 108 bytes including the NUL.
 const CHROME_TMP_SUFFIX: &str = "/org.chromium.Chromium.XXXXXX/SingletonSocket";
 
+#[derive(Clone)]
 pub struct BrowserSettings {
     pub cdp_port: u16,
     pub root: PathBuf,
@@ -58,8 +64,10 @@ pub struct Browser {
     idle: Duration,
     proxy: Option<Url>,
     state: Arc<Mutex<State>>,
+    tabs: Arc<Semaphore>,
+    starts: SyncMutex<Option<JoinSet<()>>>,
     // Drop the browser state before the root lock, so a new daemon cannot clean under a teardown.
-    _root: File,
+    root: Arc<File>,
 }
 
 enum State {
@@ -92,87 +100,236 @@ impl Browser {
             idle,
             proxy,
             state: Arc::new(Mutex::new(State::Idle)),
-            _root: root,
+            tabs: Arc::new(Semaphore::new(TABS)),
+            starts: SyncMutex::new(Some(JoinSet::new())),
+            root: Arc::new(root),
         })
     }
 
-    pub async fn fetch(&self, url: &Url) -> Result<Rendered, String> {
-        let host = url.host_str().unwrap_or("the engine");
-        let proxied = self.proxy.is_some();
-        let slow = || format!("no answer from {host} in {} s", TIMEOUT.as_secs());
-        let cdp_error = |err| match err {
-            CdpError::Timeout => slow(),
-            _ => "lost the connection to Chrome".into(),
-        };
+    pub async fn open_tab(&self, deadline: Instant) -> Result<Tab, OpenTabError> {
         let mut retried = false;
-        let (_cdp, page, deadline) = loop {
-            let (cdp, started) = {
-                let mut state = self.state.clone().lock_owned().await;
-                if let State::Running(session) = &mut *state
-                    && session.chrome_exited()
-                {
-                    end(state, State::Idle).await;
-                    state = self.state.clone().lock_owned().await;
+        let mut started = false;
+        loop {
+            let mut state = timeout_at(deadline, self.state.clone().lock_owned())
+                .await
+                .map_err(|_| STARTING)?;
+            if Instant::now() >= deadline {
+                return Err(STARTING.into());
+            }
+            if let State::Running(session) = &mut *state
+                && session.chrome_exited()
+            {
+                timeout_at(deadline, end(state, State::Idle))
+                    .await
+                    .map_err(|_| STARTING)?;
+                continue;
+            }
+            let cdp = match &mut *state {
+                State::Running(session) => {
+                    session.last_used = Instant::now();
+                    session.cdp.clone()
                 }
-                let started = matches!(*state, State::Idle);
-                if started {
-                    let session = Session::start(
-                        &self.settings,
-                        Arc::downgrade(&self.state),
-                        self.idle,
-                        self.proxy.as_ref(),
-                    )
-                    .await?;
-                    *state = State::Running(session);
+                State::Idle => {
+                    let started_session = self.start(state)?;
+                    timeout_at(deadline, started_session)
+                        .await
+                        .map_err(|_| STARTING)?
+                        .map_err(|_| STOPPING)?
+                        .map_err(OpenTabError::Message)?;
+                    started = true;
+                    continue;
                 }
-                match &mut *state {
-                    State::Running(session) => {
-                        session.last_used = Instant::now();
-                        (session.cdp.clone(), started)
-                    }
-                    State::Stopped => return Err("the browser is stopping".into()),
-                    State::Idle => unreachable!(),
-                }
+                State::Stopped => return Err(STOPPING.into()),
             };
-            let deadline = Instant::now() + TIMEOUT;
-            match timeout_at(deadline, cdp.new_page("about:blank")).await {
-                Ok(Ok(page)) => break (cdp, page, deadline),
-                Err(_) | Ok(Err(CdpError::Timeout)) => return Err(slow()),
-                Ok(Err(err)) if started || retried => return Err(cdp_error(err)),
-                Ok(Err(_)) => {
-                    // Chrome can close CDP before try_wait sees its exit. End that session if it
-                    // is still there and open one new session; an error on the new session is final.
-                    let state = self.state.clone().lock_owned().await;
+            drop(state);
+
+            let waiting_since = Instant::now();
+            let permit = timeout_at(deadline, self.tabs.clone().acquire_owned())
+                .await
+                .map_err(|_| {
+                    let seconds =
+                        rounded_seconds(deadline.saturating_duration_since(waiting_since));
+                    OpenTabError::Message(format!(
+                        "all {TABS} browser tabs stayed busy for {seconds} s"
+                    ))
+                })?
+                .expect("the tab semaphore stays open");
+            let now = Instant::now();
+            let page_deadline = deadline.min(now + TIMEOUT);
+            let page_timeout = page_deadline.saturating_duration_since(now);
+            let timed_out = || OpenTabError::PageTimeout(page_timeout);
+            if now >= page_deadline {
+                return Err(timed_out());
+            }
+
+            let opening_cdp = cdp.clone();
+            let proxied = self.proxy.is_some();
+            // CDP may finish creating the target after the query has timed out.
+            let opening = tokio::spawn(async move {
+                opening_cdp.new_page("about:blank").await.map(|page| Tab {
+                    open: Some(OpenPage {
+                        page,
+                        cdp: opening_cdp,
+                        permit,
+                    }),
+                    deadline,
+                    page_deadline,
+                    page_timeout,
+                    proxied,
+                })
+            });
+            match timeout_at(page_deadline, opening).await {
+                Ok(Ok(Ok(tab))) if Instant::now() < page_deadline => return Ok(tab),
+                Err(_) | Ok(Ok(Ok(_) | Err(CdpError::Timeout))) => return Err(timed_out()),
+                Ok(Err(_)) => return Err(LOST_CHROME.into()),
+                Ok(Ok(Err(_))) if started || retried => return Err(LOST_CHROME.into()),
+                Ok(Ok(Err(_))) => {
+                    // Chrome can close CDP before try_wait sees its exit.
+                    let state = timeout_at(deadline, self.state.clone().lock_owned())
+                        .await
+                        .map_err(|_| STARTING)?;
                     if matches!(&*state, State::Running(session) if Arc::ptr_eq(&session.cdp, &cdp))
                     {
-                        end(state, State::Idle).await;
+                        timeout_at(deadline, end(state, State::Idle))
+                            .await
+                            .map_err(|_| STARTING)?;
                     }
                     retried = true;
                 }
             }
+        }
+    }
+
+    fn start(
+        &self,
+        mut state: OwnedMutexGuard<State>,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, OpenTabError> {
+        let mut starts = self.starts.lock().expect("browser starts");
+        let starts = starts.as_mut().ok_or(STOPPING)?;
+        while starts.try_join_next().is_some() {}
+        let settings = self.settings.clone();
+        let weak_state = Arc::downgrade(&self.state);
+        let idle = self.idle;
+        let proxy = self.proxy.clone();
+        let root = self.root.clone();
+        let (send, receive) = oneshot::channel();
+        starts.spawn(async move {
+            let _root = root;
+            let result = Session::start(&settings, weak_state, idle, proxy.as_ref())
+                .await
+                .map(|session| *state = State::Running(session));
+            drop(state);
+            let _ = send.send(result);
+        });
+        Ok(receive)
+    }
+
+    pub async fn stop(&self) {
+        let starts = self.starts.lock().expect("browser starts").take();
+        if let Some(mut starts) = starts {
+            starts.shutdown().await;
+        }
+        end(self.state.clone().lock_owned().await, State::Stopped).await;
+    }
+}
+
+pub enum OpenTabError {
+    PageTimeout(Duration),
+    Message(String),
+}
+
+impl OpenTabError {
+    pub fn message(self, url: &Url) -> String {
+        match self {
+            Self::PageTimeout(wait) => page_timeout_error(url, wait),
+            Self::Message(message) => message,
+        }
+    }
+}
+
+impl From<&str> for OpenTabError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+pub struct Tab {
+    open: Option<OpenPage>,
+    deadline: Instant,
+    page_deadline: Instant,
+    page_timeout: Duration,
+    proxied: bool,
+}
+
+struct OpenPage {
+    page: Page,
+    cdp: Arc<CdpBrowser>,
+    permit: OwnedSemaphorePermit,
+}
+
+impl OpenPage {
+    fn close(self) -> JoinHandle<Result<(), CdpError>> {
+        tokio::spawn(async move {
+            let OpenPage {
+                page,
+                cdp,
+                permit: _permit,
+            } = self;
+            // Close through the browser so page unload hooks cannot keep the tab open.
+            cdp.execute(CloseTargetParams::new(page.target_id().clone()))
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+impl Tab {
+    pub async fn render(mut self, url: &Url) -> Result<Rendered, String> {
+        let host = url.host_str().unwrap_or("the engine");
+        let slow = || page_timeout_error(url, self.page_timeout);
+        let cdp_error = |err| match err {
+            CdpError::Timeout => slow(),
+            _ => LOST_CHROME.into(),
         };
-        let rendered = timeout_at(deadline, async {
+        let page = &self.open.as_ref().expect("open tab").page;
+        let rendered = timeout_at(self.page_deadline, async {
+            if Instant::now() >= self.page_deadline {
+                return Err(slow());
+            }
             page.goto(url.as_str()).await.map_err(|err| match err {
-                CdpError::ChromeMessage(text) => connect_error(&text, host, proxied),
+                CdpError::ChromeMessage(text) => connect_error(&text, host, self.proxied),
                 _ => cdp_error(err),
             })?;
             let snapshot = page.evaluate(r#"({status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0, html: document.documentElement?.outerHTML ?? ""})"#)
                 .await.map_err(cdp_error)?;
             snapshot.into_value().map_err(|_| "cannot read Chrome's rendered page".to_string())
         }).await;
-        // A timed-out page still needs a close request.
-        let closed = timeout_at(deadline, tokio::spawn(page.close())).await;
+        let closed = self.open.take().expect("open tab").close();
         let rendered = rendered.map_err(|_| slow())??;
-        closed
+        timeout_at(self.deadline, closed)
+            .await
             .map_err(|_| slow())?
-            .map_err(|_| "lost the connection to Chrome")?
+            .map_err(|_| LOST_CHROME)?
             .map_err(cdp_error)?;
         Ok(rendered)
     }
+}
 
-    pub async fn stop(&self) {
-        end(self.state.clone().lock_owned().await, State::Stopped).await;
+impl Drop for Tab {
+    fn drop(&mut self) {
+        if let Some(open) = self.open.take() {
+            open.close();
+        }
     }
+}
+
+fn page_timeout_error(url: &Url, wait: Duration) -> String {
+    let host = url.host_str().unwrap_or("the engine");
+    format!("no answer from {host} in {} s", rounded_seconds(wait))
+}
+
+fn rounded_seconds(wait: Duration) -> u64 {
+    wait.as_secs() + u64::from(wait.subsec_nanos() != 0)
 }
 
 impl Session {

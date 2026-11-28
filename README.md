@@ -124,6 +124,9 @@ A `/url?q=<target>` link uses the plain target, because it needs no extra reques
 `data-curl` URL when that is an http(s) URL on another site. Each result has `domain` when `<cite>` shows a host.
 The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`.
 
+Chrome runs up to four query tabs. Each browser query has 40 seconds for pacing, startup, the tab wait and the page.
+The page gets up to 10 seconds within that budget.
+
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
 A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
 The daemon keeps the temporary profile in `/dev/shm/scour-<uid>`, a memory-backed directory with mode `0700`.
