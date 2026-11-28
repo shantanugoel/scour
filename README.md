@@ -99,6 +99,36 @@ Before the first search, the CLI shows `idle` and the JSON field `last_state` is
 Status shows `ready_at` for active rest, a full daily window, or a pace wait longer than 30 seconds or one refill interval.
 When a deadline appears, `scour status` also prints the remaining time.
 
+## Docker
+
+1. Build the image from this directory.
+
+   ```sh
+   docker build -t scour .
+   ```
+
+2. Start the container with the port published on host loopback.
+
+   ```sh
+   docker run -d --name scour -p 127.0.0.1:7268:7268 scour
+   ```
+
+The x86_64 image is about 138 MB and contains the HTTP engines.
+Use `http://127.0.0.1:7268` on the host to reach the daemon.
+
+Using `-p 7268:7268` exposes the daemon to the LAN. Other containers on the same Docker network can reach the
+daemon even when the published port uses host loopback. If you run other containers, create a separate network
+with `docker network create scour`. Add `--network scour` before the image name and leave unrelated containers
+off that network.
+
+Arguments after the image name go to `scour serve`. To use a config file, mount it read-only and pass its path
+inside the container.
+
+```sh
+docker run -d --name scour -p 127.0.0.1:7268:7268 \
+  -v "$PWD/config.toml:/etc/scour/config.toml:ro" scour --config /etc/scour/config.toml
+```
+
 ## Use MCP
 
 The daemon also answers MCP over streamable HTTP at `http://127.0.0.1:7268/mcp`. It has one tool, `search`, with
