@@ -6,11 +6,13 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
-use crate::engines::{self, Engine, duckduckgo};
+use crate::engines::{self, Engine, Method, duckduckgo};
 use crate::limits::LimitSettings;
 
 pub struct Config {
     pub engines: Vec<&'static Engine>,
+    /// The method of each engine, from a `name@method` item. A missing entry is `http`.
+    pub methods: HashMap<&'static str, Method>,
     pub proxy: Option<Url>,
     pub base_urls: HashMap<&'static str, Url>,
     pub rest: Duration,
@@ -21,6 +23,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             engines: vec![&duckduckgo::ENGINE],
+            methods: HashMap::new(),
             proxy: None,
             base_urls: HashMap::new(),
             rest: Duration::from_secs(600),
@@ -98,7 +101,7 @@ fn parse(text: &str) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|err| toml_error(&err, text))?;
     let mut config = Config::default();
     if let Some(names) = file.engines {
-        config.engines = select_engines(names)?;
+        (config.engines, config.methods) = select_engines(names)?;
     }
     if let Some(value) = file.proxy {
         config.proxy = Some(parse_proxy(&value).map_err(str::to_string)?);
@@ -184,21 +187,29 @@ pub fn proxy_address(url: &Url) -> String {
     format!("{}://{host}:{port}", url.scheme())
 }
 
-fn select_engines(names: Vec<String>) -> Result<Vec<&'static Engine>, String> {
+fn select_engines(
+    names: Vec<String>,
+) -> Result<(Vec<&'static Engine>, HashMap<&'static str, Method>), String> {
     if names.is_empty() {
         return Err("the engines list is empty".to_string());
     }
     let mut selected: Vec<&'static Engine> = Vec::with_capacity(names.len());
-    for name in names {
-        let Some(engine) = engines::find(&name) else {
-            return Err(format!("unknown engine `{name}`"));
+    let mut methods = HashMap::new();
+    for item in names {
+        let (name, method) = engines::parse_item(&item)?;
+        let Some(engine) = engines::find(name) else {
+            return Err(format!("unknown engine `{item}`"));
         };
         if selected.iter().any(|chosen| chosen.name == engine.name) {
-            return Err(format!("engine `{name}` is listed more than once"));
+            return Err(format!("engine `{item}` is listed more than once"));
+        }
+        if let Some(method) = method {
+            method.check_available(&item)?;
+            methods.insert(engine.name, method);
         }
         selected.push(engine);
     }
-    Ok(selected)
+    Ok((selected, methods))
 }
 
 /// The source line can hold a secret. Show only the parser message and the line number.
@@ -247,6 +258,17 @@ mod tests {
     fn engines_key_enables_each_named_engine_in_order() {
         let config = load_text("two-engines", "engines = [\"duckduckgo\", \"bing\"]\n").unwrap();
         assert_eq!(names(&config), ["duckduckgo", "bing"]);
+    }
+
+    #[test]
+    fn engines_key_accepts_a_method_after_the_name() {
+        let config = load_text(
+            "engine-methods",
+            "engines = [\"duckduckgo@http\", \"bing@http\"]\n",
+        )
+        .unwrap();
+        assert_eq!(names(&config), ["duckduckgo", "bing"]);
+        assert_eq!(config.methods.get("bing"), Some(&Method::Http));
     }
 
     #[test]

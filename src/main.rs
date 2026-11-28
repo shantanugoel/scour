@@ -33,7 +33,13 @@ enum Command {
         config: Option<PathBuf>,
     },
     /// Ask the local daemon to search.
-    Search { query: String },
+    Search {
+        /// The words to search for.
+        query: String,
+        /// Ask only these engines, as a comma list of `name` or `name@method`.
+        #[arg(long)]
+        engines: Option<String>,
+    },
     /// Show engine health and daily counts.
     Status,
 }
@@ -42,7 +48,9 @@ enum Command {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve { config } => serve(config).await,
-        Command::Search { query } => cli::search(&query).await,
+        Command::Search { query, engines } => {
+            cli::search(api::ADDR, &query, engines.as_deref()).await
+        }
         Command::Status => cli::status(api::ADDR).await,
     }
 }

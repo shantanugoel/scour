@@ -6,13 +6,16 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use crate::api::{ADDR, EngineState, SearchResponse, StatusResponse};
+use crate::api::{ADDR, EngineState, EngineStatus, SearchResponse, StatusResponse};
 
 const DAEMON_WAIT: Duration = Duration::from_secs(45);
 
-pub async fn search(query: &str) -> ExitCode {
-    let mut url = Url::parse(&format!("http://{ADDR}/search")).expect("daemon URL");
+pub async fn search(address: SocketAddr, query: &str, engines: Option<&str>) -> ExitCode {
+    let mut url = Url::parse(&format!("http://{address}/search")).expect("daemon URL");
     url.query_pairs_mut().append_pair("q", query);
+    if let Some(engines) = engines {
+        url.query_pairs_mut().append_pair("engines", engines);
+    }
     let response: SearchResponse = match request_daemon(&url, "search").await {
         Ok(response) => response,
         Err(line) => {
@@ -80,6 +83,7 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
         stdout.push('\n');
     }
     for engine in &response.engines {
+        let name = engine_label(engine);
         let state = state_name(engine.state);
         let daily = format!("{}/{} daily", engine.daily_count, engine.daily_limit);
         match engine.state {
@@ -89,27 +93,18 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
                     .iter()
                     .filter(|result| result.engine == engine.name)
                     .count();
-                stdout.push_str(&format!(
-                    "{}: {state} ({count} results) ({daily})\n",
-                    engine.name
-                ));
+                stdout.push_str(&format!("{name}: {state} ({count} results) ({daily})\n"));
             }
             EngineState::Blocked | EngineState::Limited => {
                 let ready = deadline_text(engine.ready_at.as_deref(), now);
-                stderr.push_str(&format!(
-                    "scour: {}: {state} ({daily}){ready}\n",
-                    engine.name
-                ));
+                stderr.push_str(&format!("scour: {name}: {state} ({daily}){ready}\n"));
             }
             EngineState::ParseFailed => {
-                stderr.push_str(&format!("scour: {}: {state} ({daily})\n", engine.name));
+                stderr.push_str(&format!("scour: {name}: {state} ({daily})\n"));
             }
             EngineState::Error => {
                 let message = engine.error.as_deref().unwrap_or("error");
-                stderr.push_str(&format!(
-                    "scour: {}: {state}: {message} ({daily})\n",
-                    engine.name
-                ));
+                stderr.push_str(&format!("scour: {name}: {state}: {message} ({daily})\n"));
             }
         }
     }
@@ -125,6 +120,10 @@ fn present(response: &SearchResponse, now: DateTime<Utc>) -> Presented {
             ExitCode::from(1)
         },
     }
+}
+
+fn engine_label(engine: &EngineStatus) -> String {
+    format!("{}@{}", engine.name, engine.method.name())
 }
 
 fn state_name(state: EngineState) -> &'static str {
@@ -210,6 +209,7 @@ fn timeout_message() -> String {
 mod tests {
     use super::*;
     use crate::api::{EngineStatus, ResultItem};
+    use crate::engines::Method;
 
     #[test]
     fn partial_failure_prints_results_and_summary_to_stdout_and_block_to_stderr() {
@@ -225,6 +225,7 @@ mod tests {
             engines: vec![
                 EngineStatus {
                     name: "duckduckgo".to_string(),
+                    method: Method::Http,
                     state: EngineState::Blocked,
                     error: None,
                     daily_count: 1,
@@ -233,6 +234,7 @@ mod tests {
                 },
                 EngineStatus {
                     name: "bing".to_string(),
+                    method: Method::Http,
                     state: EngineState::Ok,
                     error: None,
                     daily_count: 1,
@@ -246,11 +248,11 @@ mod tests {
         assert_eq!(presented.exit_code, ExitCode::SUCCESS);
         assert_eq!(
             presented.stdout,
-            "1. Tokio\nhttps://tokio.rs/\nAn asynchronous runtime\n\nbing: ok (1 results) (1/200 daily)\n"
+            "1. Tokio\nhttps://tokio.rs/\nAn asynchronous runtime\n\nbing@http: ok (1 results) (1/200 daily)\n"
         );
         assert_eq!(
             presented.stderr,
-            "scour: duckduckgo: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n"
+            "scour: duckduckgo@http: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n"
         );
     }
 
@@ -262,6 +264,7 @@ mod tests {
             engines: vec![
                 EngineStatus {
                     name: "duckduckgo".to_string(),
+                    method: Method::Http,
                     state: EngineState::Blocked,
                     error: None,
                     daily_count: 1,
@@ -270,6 +273,7 @@ mod tests {
                 },
                 EngineStatus {
                     name: "bing".to_string(),
+                    method: Method::Http,
                     state: EngineState::Limited,
                     error: None,
                     daily_count: 6,
@@ -285,8 +289,8 @@ mod tests {
         assert_eq!(
             presented.stderr,
             concat!(
-                "scour: duckduckgo: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n",
-                "scour: bing: limited (6/200 daily) until 2026-01-01T00:00:45Z (in 45 s)\n",
+                "scour: duckduckgo@http: blocked (1/200 daily) until 2026-01-01T00:10:00Z (in 10 min)\n",
+                "scour: bing@http: limited (6/200 daily) until 2026-01-01T00:00:45Z (in 45 s)\n",
             )
         );
     }
@@ -298,6 +302,7 @@ mod tests {
             results: Vec::new(),
             engines: vec![EngineStatus {
                 name: "bing".to_string(),
+                method: Method::Http,
                 state: EngineState::Error,
                 error: Some("cannot connect to www.bing.com".to_string()),
                 daily_count: 1,
@@ -310,7 +315,7 @@ mod tests {
         assert!(presented.stdout.is_empty());
         assert_eq!(
             presented.stderr,
-            "scour: bing: error: cannot connect to www.bing.com (1/200 daily)\n"
+            "scour: bing@http: error: cannot connect to www.bing.com (1/200 daily)\n"
         );
         assert!(!presented.stderr.contains("ok"));
         assert!(!presented.stderr.contains("empty"));
@@ -327,6 +332,7 @@ mod tests {
                 results: Vec::new(),
                 engines: vec![EngineStatus {
                     name: "duckduckgo".to_string(),
+                    method: Method::Http,
                     state,
                     error: None,
                     daily_count: 1,
@@ -340,7 +346,7 @@ mod tests {
             assert!(
                 presented
                     .stderr
-                    .starts_with(&format!("scour: duckduckgo: {name}")),
+                    .starts_with(&format!("scour: duckduckgo@http: {name}")),
                 "{}",
                 presented.stderr
             );
@@ -358,6 +364,7 @@ mod tests {
             results: Vec::new(),
             engines: vec![EngineStatus {
                 name: "duckduckgo".to_string(),
+                method: Method::Http,
                 state: EngineState::Blocked,
                 error: None,
                 daily_count: 1,
@@ -378,7 +385,7 @@ mod tests {
             assert_eq!(
                 presented.stderr,
                 format!(
-                    "scour: duckduckgo: blocked (1/200 daily) until {ready_at} (in {countdown})\n"
+                    "scour: duckduckgo@http: blocked (1/200 daily) until {ready_at} (in {countdown})\n"
                 ),
                 "{milliseconds} ms remaining"
             );
@@ -392,6 +399,7 @@ mod tests {
             results: Vec::new(),
             engines: vec![EngineStatus {
                 name: "bing".to_string(),
+                method: Method::Http,
                 state: EngineState::Empty,
                 error: None,
                 daily_count: 1,
@@ -402,7 +410,10 @@ mod tests {
         let presented = present(&response, Utc::now());
         assert_eq!(presented.exit_code, ExitCode::SUCCESS);
         assert!(presented.stderr.is_empty());
-        assert_eq!(presented.stdout, "bing: empty (0 results) (1/200 daily)\n");
+        assert_eq!(
+            presented.stdout,
+            "bing@http: empty (0 results) (1/200 daily)\n"
+        );
     }
 
     #[test]
@@ -428,6 +439,7 @@ mod tests {
             engines: vec![
                 EngineStatus {
                     name: "duckduckgo".to_string(),
+                    method: Method::Http,
                     state: EngineState::Ok,
                     error: None,
                     daily_count: 1,
@@ -436,6 +448,7 @@ mod tests {
                 },
                 EngineStatus {
                     name: "bing".to_string(),
+                    method: Method::Http,
                     state: EngineState::Ok,
                     error: None,
                     daily_count: 1,
@@ -449,12 +462,12 @@ mod tests {
         assert!(
             presented
                 .stdout
-                .contains("duckduckgo: ok (1 results) (1/200 daily)\n")
+                .contains("duckduckgo@http: ok (1 results) (1/200 daily)\n")
         );
         assert!(
             presented
                 .stdout
-                .contains("bing: ok (1 results) (1/200 daily)\n")
+                .contains("bing@http: ok (1 results) (1/200 daily)\n")
         );
         assert!(presented.stderr.is_empty());
     }

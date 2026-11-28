@@ -317,3 +317,13 @@ fn default_config_falls_back_to_home() {
     let _ = std::fs::remove_dir_all(&root);
     assert_exit_one(&output, "the engines list is empty");
 }
+
+#[test]
+fn a_browser_engine_with_the_browser_off_exits_one_naming_the_item_and_the_flag() {
+    let path = config_file("browser-engine", "engines = [\"duckduckgo@browser\"]\n");
+    let output = serve_with_config(&path);
+    let _ = std::fs::remove_file(&path);
+    let stderr = assert_exit_one(&output, "duckduckgo@browser");
+    assert!(stderr.contains("--browser"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
