@@ -85,7 +85,7 @@ solver plugin.
 - We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 0 of 238 plain HTTP Bing
   results matched the query. Brave gave HTTP 429 and Mojeek gave HTTP 403. A person can turn on Bing. Brave and
   Mojeek are planned.
-- We do not promise that Bing works through the browser. A person can send Bing through the planned browser tier,
+- We do not promise that Bing works through the browser. A person can send Bing through the browser tier,
   but the results in headful Chrome were not stable. In the Bing-in-Chrome spike (#31), direct loads got Turnstile on
   3 of 4 tries. After a person solved it, 0 of 30 results matched the query. In the Ardia spike (#32), the same
   Chrome setup got Bing results on 6 of 6 queries, and 24 of 57 results matched all query words.
@@ -107,7 +107,9 @@ solver plugin.
 - **Platform and language:** Rust, because the owner selected it and a static binary is small. The spike program
   with `wreq` is a static musl binary of 8.2 MB, with a peak of 28.8 MiB of memory. Linux only for the first
   release. There are two Docker images: `scour` (the binary and the cheap engines) and `scour:browser` (the
-  binary, Chrome and Xvfb). On bare Linux, the user installs Chrome and Xvfb, and sets the path of Chrome.
+  binary, Chrome and Xvfb). On bare Linux, the user installs Chrome or Chromium and Xvfb.
+  scour runs `Xvfb` from `PATH`. For Chrome, it checks `CHROME`, then `chrome`, `chrome-browser`,
+  `google-chrome-stable`, `chromium` and `chromium-browser` on `PATH`, in that order.
 - **Cost:** The core uses no paid service. A CAPTCHA solver service is an external plugin that the user pays for.
   Tests make no paid model call.
 - **Privacy and data:** scour runs on the machine of the user. It keeps no queries and no results on disk. It keeps

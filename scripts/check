@@ -4,6 +4,14 @@ cd "$(dirname "$0")/.."
 # LIBCLANG_PATH can point at another clang, for example an ESP toolchain.
 # That clang is 32-bit, and the build then looks for gnu/stubs-32.h.
 unset LIBCLANG_PATH
+if ! command -v Xvfb >/dev/null 2>&1; then
+    if ! docker info >/dev/null 2>&1; then
+        echo 'scripts/check: the browser tests need Xvfb, or Docker to run Xvfb' >&2
+        exit 1
+    fi
+    docker build -q -t scour-check-xvfb scripts/xvfb-docker
+    export PATH="$PWD/scripts/xvfb-docker:$PATH"
+fi
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
