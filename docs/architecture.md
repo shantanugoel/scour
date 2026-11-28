@@ -46,7 +46,7 @@ flowchart LR
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Planned: the `http` and `browser` methods of an engine share this one state. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike, a Google result page from more than 3 hours after a solve (`.evidence/15/fixture-result-after-3h.html`, 8 results in `#rso`, with `/goto?url=` result links and the target domain in `<cite>`), and the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo and Bing |
-| Packaging | Has two Docker images. `scour` has only the binary and the cheap engines. `scour:browser` adds Chrome and Xvfb. The installed Chromium of the browser spike is 437 MB, so `scour:browser` is several hundred MB. The image size is not measured yet. On a Linux host without Docker, the user installs Chrome and Xvfb, and sets the path of Chrome. | Docker, static musl binary | planned |
+| Packaging | The x86_64 `scour` image is about 138 MB and runs the HTTP engines. The planned `scour:browser` image adds Chromium and Xvfb. The installed Chromium of the browser spike is 437 MB. For the planned browser tier on a Linux host, the user installs Chrome and Xvfb and sets the path of Chrome. | Docker, static musl binary | `scour` built, `scour:browser` planned |
 
 ## Data
 
@@ -175,8 +175,9 @@ flowchart LR
   Unknown keys and engine subtables also stop startup with exit code 1.
   For local tests, `[testing].rest_seconds` sets a positive base duration.
   `[testing.base_urls]` maps enabled engine names to HTTP or HTTPS URLs. Unknown and disabled engine keys fail at startup.
-  The listen address stays fixed at `127.0.0.1:7268`. A later milestone can add a listen flag
-  for Docker. That change makes the localhost invariant weaker for that case, so the owner decides it then.
+  The listen address stays fixed at `127.0.0.1:7268`. In Docker, `socat` listens on each non-loopback container IPv4
+  address on port 7268 and forwards TCP bytes to the daemon. The daemon checks the original `Host` and `Origin` headers.
+  The image runs as user `scour` (UID 10001), with `/home/scour/.config/scour/config.toml` as the default config path.
 - **State.** The daemon writes no query and no result to disk. It prints one start line and no query. It installs
   no `tracing` subscriber, so a library log call cannot print a query. Engine limits and health live in memory.
   Each engine has its own mutex. The code releases it before any wait or network request.
@@ -296,9 +297,25 @@ flowchart LR
   loses nothing that a client must renew. We did not use `legacy_session_mode`, because a session ID adds a
   handshake and a session table for a tool that holds no conversation state. If a client needs sessions, turn that
   mode on and record why.
-- **Two Docker images.** Users who do not need Google do not download a browser. We did not use one image, because
-  Chrome makes it several hundred MB larger: the installed Chromium is 437 MB. `scour:browser` has one browser,
-  not two.
+- **Docker packaging.** The plain image contains the HTTP engines. The browser image is planned.
+  1. **Container IPv4 addresses.** A forwarder on `0.0.0.0:7268` conflicts with the daemon on `127.0.0.1:7268`.
+     `socat` binds to the non-loopback IPv4 addresses from `hostname -i`. On a single bridge, `/proc/net/tcp` shows
+     the daemon and one forwarder. A Rust forwarding command would put a configurable non-loopback listener in
+     every build.
+  2. **Tini.** As PID 1, `scour` would ignore SIGTERM. Tini forwards SIGTERM to the daemon and reaps orphaned
+     children. A shell trap does not reliably reap orphans. The planned browser tier also needs this for Chrome and
+     Xvfb. Tini is built into the image so the run command needs no `--init` flag.
+  3. **Debian slim.** The planned browser image can install Debian Chromium and Xvfb, as in spikes #15 and #37.
+     The Debian base is about 116 MB, compared with about 14 MB for Alpine. The binary uses CA roots from
+     `webpki-roots` through `wreq`.
+  4. **Zig.** BoringSSL (`btls-sys` 0.5.6) needs `cmake`, `git`, `libclang` and a C++ standard library.
+     Debian's `musl-tools` supplies no musl C++ toolchain. The Alpine musl Rust image could not load `libclang`
+     in spike #1. Zig supplies musl C and C++ toolchains and supports the planned arm64 cross-build.
+  5. **Static build check.** On `master` at `e5c35a6`, the Zig build took 1 min 16 s and produced a static
+     binary of 12,905,568 bytes. `scour serve --help` showed `--config` as the only daemon option.
+  6. **Stage layout.** The `runtime` stage supplies the files and entrypoint used by the final `scour` stage.
+     The planned `browser` target will also extend `runtime`, before the final `scour` stage. A build with
+     `--target browser` will select the browser image. A default build produces the plain image.
 
 ## Unknowns
 
