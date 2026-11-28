@@ -11,7 +11,7 @@ use url::Url;
 use crate::api::{
     EngineHealth, EngineState, EngineStatus, ResultItem, SearchResponse, StatusResponse,
 };
-use crate::browser::{Browser, BrowserSettings};
+use crate::browser::Browser;
 use crate::config::Config;
 use crate::engines::{self, Engine, Hit, Method, Page};
 use crate::limits::{Admit, Limits};
@@ -57,7 +57,7 @@ impl Answer {
 }
 
 impl Searcher {
-    pub fn new(config: &Config, browser: Option<BrowserSettings>) -> wreq::Result<Self> {
+    pub fn new(config: &Config, browser: Option<Browser>) -> wreq::Result<Self> {
         let builder = http_client_builder();
         let builder = match &config.proxy {
             Some(url) => {
@@ -70,11 +70,12 @@ impl Searcher {
         Ok(Self::with_client(config, client, browser))
     }
 
-    fn with_client(
-        config: &Config,
-        client: wreq::Client,
-        browser: Option<BrowserSettings>,
-    ) -> Self {
+    pub fn with_browser(mut self, browser: Option<Browser>) -> Self {
+        self.browser = browser;
+        self
+    }
+
+    fn with_client(config: &Config, client: wreq::Client, browser: Option<Browser>) -> Self {
         let engines = config
             .engines
             .iter()
@@ -95,7 +96,7 @@ impl Searcher {
             .collect();
         Self {
             client,
-            browser: browser.map(Browser::new),
+            browser,
             engines,
             daily_limit: config.limits.daily,
         }

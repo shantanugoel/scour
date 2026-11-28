@@ -49,19 +49,36 @@ flowchart LR
 
 ## Browser lifecycle
 
+- The browser root is `/dev/shm/scour-<uid>`, a memory-backed directory with mode `0700`.
+  The daemon binds `127.0.0.1:7268` first. Then it locks the root with `flock` and only the lock holder deletes
+  left-over entries. The kernel frees the lock at any death, including `kill -9`.
+  Start-up cleanup removes each run directory from a dead daemon and each `/tmp/.X<n>-lock` whose content is that
+  daemon's PID. It never removes an X socket or another process's X lock. The root must be a real directory of
+  this user, because the cleanup deletes every entry.
+- A run directory is `<root>/<pid>-<nanos>/`. It holds `display`, `profile/` and `tmp/`. The short path leaves
+  room for Chrome's process-singleton socket under the kernel's Unix socket limit.
 - The daemon chooses an X display that has neither a file socket nor a Linux abstract socket.
   It reserves the display with `/tmp/.X<n>-lock`. Xvfb uses `-displayfd` to report readiness.
 - The daemon reads the CDP WebSocket URL from Chrome's stderr and discards the rest of stderr.
   Chrome must announce the fixed endpoint at `127.0.0.1:7269`.
   Omitting `--remote-allow-origins` keeps Chrome's default Origin checks.
 - Query tabs share one CDP browser context. Its cache, history, cookies and storage stay in memory.
-  Chrome starts with a temporary profile and a blank tab. The run directory is under `/tmp`, because Chrome's
-  process-singleton socket path must fit the kernel's Unix socket limit. Its `TMPDIR` is inside that directory.
+  Chrome starts with a temporary profile and a blank tab. Its `TMPDIR` is inside the run directory.
+- One supervisor task for each Chrome session ends the session when Chrome exits or when
+  `[browser] idle_seconds` passes without a query. The default is 5400 seconds (90 minutes); the range is
+  1 to 86400. A query that holds the CDP client makes the session busy, so the supervisor checks again later.
+  The deferred check stays in the supervisor's `select!`, so a Chrome crash still ends the session at once.
+  The run directory and profile go away on both paths.
+- A query that reuses a running session and loses CDP while it opens its page ends that session and starts
+  one new session. An error on the new session, or any error after navigation starts, is final.
+- `Group::spawn` sets `PR_SET_PDEATHSIG` in `pre_exec`. Chrome gets SIGKILL and Xvfb gets SIGTERM when the daemon
+  dies. The signal fires when the spawning thread exits, so the daemon spawns children only on the runtime thread;
+  `main` keeps the `current_thread` runtime.
 - Ctrl-C, SIGTERM, server errors and failed starts release the resources the daemon acquired.
   The daemon kills Chrome's process group, deletes the run directory, stops Xvfb with SIGTERM, and releases the lock.
-  It sends SIGKILL if Xvfb takes more than five seconds to stop.
-- Browser proxy support, IPv4-only engine connections, idle stop, crash cleanup, tab limits and a
-  user-supplied CDP URL are planned.
+  It sends SIGKILL if Xvfb takes more than five seconds to stop. A teardown keeps the state lock until the old
+  session is gone, so a new start never overlaps it.
+- Browser proxy support, IPv4-only engine connections, tab limits and a user-supplied CDP URL are planned.
 
 ## Data
 
@@ -191,6 +208,8 @@ flowchart LR
   The inclusive ranges are 1 to 1000 for `burst`, 1 to 86400 for `refill_seconds`, and 1 to 4294967295 for `daily`.
   An invalid value stops startup with exit code 1 and a message that names the key and omits the value.
   Unknown keys and engine subtables also stop startup with exit code 1.
+  The optional `[browser] idle_seconds` key sets the Chrome idle stop. It is a whole number of seconds from 1 to
+  86400, and the default is 5400 (90 minutes). The key loads with or without `--browser`.
   For local tests, `[testing].rest_seconds` sets a positive base duration.
   `[testing.base_urls]` maps enabled engine names to HTTP or HTTPS URLs. Unknown and disabled engine keys fail at startup.
   The listen address stays fixed at `127.0.0.1:7268`. In Docker, `socat` listens on each non-loopback container IPv4
@@ -232,7 +251,7 @@ flowchart LR
     CDP still creates tabs in the disk-backed default context. Cache flags leave history and other files on disk.
   - The daemon owns the X lock because `-displayfd` turns off Xvfb's lock. It checks abstract sockets on the
     host because Docker's network namespace hides them from the test Xvfb.
-  - The run directory is under `/tmp`, and Chrome's private `TMPDIR` is inside it. This keeps the
+  - The run directory is under `/dev/shm/scour-<uid>`, and Chrome's private `TMPDIR` is inside it. This keeps the
     process-singleton socket path short and lets the run-directory guard clean up its
     `org.chromium.Chromium.*` directory after SIGKILL.
   - Chrome uses `--password-store=basic` and `--use-mock-keychain` because Chromium can hang on the system keyring.
@@ -249,6 +268,16 @@ flowchart LR
 - **The browser as a child process, not a library.** A browser crash does not stop the daemon, and the binary stays
   small. Chrome is not available as a library. We did not link a V8 browser such as Obscura, because V8 makes the
   binary approximately 70 MB, a V8 crash stops the daemon, and Obscura got no Google results.
+- **One locked browser root for each user.** The root is `/dev/shm/scour-<uid>`, and the daemon takes a `flock`
+  on it after the bind. This gives three results. (1) The kernel frees the lock at any death, so a new daemon
+  can clean after `kill -9`. (2) `/dev/shm` is tmpfs on systemd hosts and in Docker; `/tmp` is not always.
+  (3) The root must be a real directory of this user, because the cleanup deletes every entry. The daemon opens
+  it with `O_DIRECTORY | O_NOFOLLOW`, checks its owner with `fstat`, and reads and removes entries through the
+  locked descriptor, so a swapped path cannot redirect the cleanup.
+- **A teardown completes before a new session starts.** (1) `PR_SET_PDEATHSIG` fires when the spawning thread
+  exits, so children start only on the runtime thread. (2) `end` drops the old session under the lock, so a query
+  waits for a teardown and does not overlap it. (3) The Docker shim's watcher outlives `stop`, so it can remove
+  a container that an in-flight create adds.
 - **Cheap HTTP engines by default, Google opt-in.** DuckDuckGo answered each paced query in a median time of
   approximately 0.7 s. Google gave no results to raw HTTP or to replayed browser cookies. We did not use the browser
   for all engines, because headful Chrome on Xvfb used a peak PSS of 696 MiB and an idle PSS of 551 MiB (#32),

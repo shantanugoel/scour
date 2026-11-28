@@ -53,12 +53,13 @@ poll() {
     done
 }
 
+# Set `display` here, not in a subshell, so that `created_displays` is set for the EXIT trap.
 free_display() {
     n=90
     while [ "$n" -lt 100 ]; do
         if [ ! -e "/tmp/.X11-unix/X$n" ] && [ ! -e "/tmp/.X$n-lock" ]; then
             created_displays="$created_displays $n"
-            echo "$n"
+            display=$n
             return 0
         fi
         n=$((n + 1))
@@ -67,10 +68,13 @@ free_display() {
 }
 
 run_shim() {
-    display=$1
     "$shim" ":$display" -displayfd 1 -screen 0 640x480x24 -nolisten tcp \
         >"$work/display-$display" 2>"$work/error-$display" &
     child=$!
+}
+
+docker_child() {
+    pgrep -P "$child" -x docker >/dev/null
 }
 
 clean_after() {
@@ -80,25 +84,27 @@ clean_after() {
 }
 
 # A normal stop lets Xvfb remove its own socket.
-display=$(free_display)
-run_shim "$display"
+free_display
+run_shim
 poll 'the Xvfb socket' socket_up
 kill -TERM "$child"
 wait "$child" 2>/dev/null || true
 clean_after SIGTERM
 
 # SIGKILL cannot run the shell trap. The watcher must stop the container cleanly.
-display=$(free_display)
-run_shim "$display"
+free_display
+run_shim
 poll 'the Xvfb socket' socket_up
 poll 'the container to start' new_container
 kill -KILL "$child"
 wait "$child" 2>/dev/null || true
 clean_after SIGKILL
 
-# A signal before the container starts must not leave a created container.
-display=$(free_display)
-run_shim "$display"
+# A signal during the start must not leave a created container. Wait until the shim has started
+# docker, then send SIGTERM to the shim PID only, as PDEATHSIG does.
+free_display
+run_shim
+poll 'docker run to start' docker_child
 kill -TERM "$child"
 wait "$child" 2>/dev/null || true
 clean_after 'SIGTERM during start'

@@ -16,6 +16,7 @@ pub struct Config {
     pub proxy: Option<Url>,
     pub base_urls: HashMap<&'static str, Url>,
     pub rest: Duration,
+    pub browser_idle: Duration,
     pub limits: LimitSettings,
 }
 
@@ -27,6 +28,7 @@ impl Default for Config {
             proxy: None,
             base_urls: HashMap::new(),
             rest: Duration::from_secs(600),
+            browser_idle: Duration::from_secs(5400),
             limits: LimitSettings::default(),
         }
     }
@@ -40,6 +42,8 @@ struct File {
     #[serde(default)]
     limits: LimitsFile,
     #[serde(default)]
+    browser: BrowserFile,
+    #[serde(default)]
     testing: Testing,
 }
 
@@ -49,6 +53,12 @@ struct LimitsFile {
     burst: Option<toml::Value>,
     refill_seconds: Option<toml::Value>,
     daily: Option<toml::Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserFile {
+    idle_seconds: Option<toml::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -126,6 +136,13 @@ fn parse(text: &str, browser: bool) -> Result<Config, String> {
         "limits.daily must be a whole number from 1 to 4294967295",
     )? {
         config.limits.daily = daily;
+    }
+    if let Some(seconds) = limit_value(
+        file.browser.idle_seconds,
+        86400,
+        "browser.idle_seconds must be a whole number of seconds from 1 to 86400",
+    )? {
+        config.browser_idle = Duration::from_secs(u64::from(seconds));
     }
     if let Some(seconds) = file.testing.rest_seconds {
         if seconds <= 0 {
@@ -255,6 +272,12 @@ mod tests {
 
     fn names(config: &Config) -> Vec<&'static str> {
         config.engines.iter().map(|engine| engine.name).collect()
+    }
+
+    #[test]
+    fn browser_idle_defaults_to_90_minutes() {
+        let config = load_text("no-idle", "# no keys\n").unwrap();
+        assert_eq!(config.browser_idle, Duration::from_secs(5400));
     }
 
     #[test]

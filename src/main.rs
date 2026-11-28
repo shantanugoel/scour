@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
-use browser::BrowserSettings;
+use browser::{Browser, BrowserSettings};
 
 #[derive(Parser)]
 #[command(name = "scour")]
@@ -108,13 +108,17 @@ async fn start_daemon(
     browser: Option<BrowserSettings>,
 ) -> Result<Daemon, String> {
     let config = config::load(config_path, browser.is_some())?;
-    let searcher = Arc::new(
-        search::Searcher::new(&config, browser)
-            .map_err(|_| "cannot start the search client".to_string())?,
-    );
+    // A bad search client fails before the bind, and the browser root opens only after the bind,
+    // so its cleanup never runs before the daemon owns the listen address.
+    let searcher = search::Searcher::new(&config, None)
+        .map_err(|_| "cannot start the search client".to_string())?;
     let listener = TcpListener::bind(address)
         .await
         .map_err(|err| format!("cannot listen on {address}: {err}"))?;
+    let browser = browser
+        .map(|settings| Browser::open(settings, config.browser_idle))
+        .transpose()?;
+    let searcher = Arc::new(searcher.with_browser(browser));
     let bound_address = listener
         .local_addr()
         .map_err(|err| format!("cannot read the listen address: {err}"))?;

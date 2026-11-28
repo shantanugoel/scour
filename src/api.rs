@@ -1230,10 +1230,15 @@ bing = "{engine_base}"
         let config = crate::config::load(Some(&path), true);
         std::fs::remove_file(path).unwrap();
         // The browser starts on the first browser query, and this test sends none.
-        let browser = crate::browser::BrowserSettings {
-            cdp_port: 0,
-            root: std::env::temp_dir().join(name),
-        };
+        let root = std::env::temp_dir().join(name);
+        let browser = crate::browser::Browser::open(
+            crate::browser::BrowserSettings {
+                cdp_port: 0,
+                root: root.clone(),
+            },
+            Config::default().browser_idle,
+        )
+        .unwrap();
         let searcher = Arc::new(Searcher::new(&config.unwrap(), Some(browser)).unwrap());
         let (base, _) = serve(router(searcher)).await;
 
@@ -1250,6 +1255,8 @@ bing = "{engine_base}"
             assert!(text.contains("google@http"), "{items:?}: {text}");
         }
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        // No session started, so the root holds no run directory.
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
