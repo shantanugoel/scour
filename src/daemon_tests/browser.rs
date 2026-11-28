@@ -341,7 +341,7 @@ async fn idle_browser_stop_removes_the_profile_and_starts_a_new_chrome() {
 async fn a_chrome_crash_during_a_busy_query_ends_the_session() {
     let _displays = DISPLAYS.lock().await;
     let (engine, requests) = slow_fixture_server().await;
-    let mut daemon = TestDaemon::start_idle('u', "duckduckgo@browser", engine, 0, None, 8).await;
+    let mut daemon = TestDaemon::start_idle('u', "duckduckgo@browser", engine, 0, None, 6).await;
     let request = tokio::spawn(search(daemon.address, None));
     let run = poll("the browser to start", Duration::from_secs(15), || {
         fs::read_dir(daemon.browser_root())
@@ -360,8 +360,9 @@ async fn a_chrome_crash_during_a_busy_query_ends_the_session() {
         (requests.load(Ordering::Relaxed) > 0).then_some(())
     })
     .await;
-    // The idle deadline passes while the slow query holds the CDP client.
-    sleep(Duration::from_secs(9)).await;
+    // The idle deadline passes while the slow query holds the CDP client. Kill before the
+    // page timeout, so the query is still busy on its own and not because of the timeout.
+    sleep(Duration::from_secs(7)).await;
     assert!(
         !request.is_finished(),
         "the query finished before the crash"

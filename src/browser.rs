@@ -564,7 +564,14 @@ impl Group {
         // runtime thread: `main` keeps the current_thread runtime, and pool threads retire.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, stop_signal as libc::c_ulong) == -1 {
+                let death_signal = libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    stop_signal as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
+                if death_signal == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::getppid() != parent {
