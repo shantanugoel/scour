@@ -46,7 +46,7 @@ flowchart LR
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Planned: the `http` and `browser` methods of an engine share this one state. | Rust, in memory | built for DuckDuckGo and Bing |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo and Bing pages test the parsers. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: a saved Google result page and Google block page from the browser spike, a Google result page from more than 3 hours after a solve (`.evidence/15/fixture-result-after-3h.html`, 8 results in `#rso`, with `/goto?url=` result links and the target domain in `<cite>`), and the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo and Bing |
-| Packaging | The x86_64 `scour` image is about 138 MB and runs the HTTP engines. The planned `scour:browser` image adds Chromium and Xvfb. The installed Chromium of the browser spike is 437 MB. For the planned browser tier on a Linux host, the user installs Chrome and Xvfb and sets the path of Chrome. | Docker, static musl binary | `scour` built, `scour:browser` planned |
+| Packaging | The `scour` image runs the HTTP engines and is about 138 MB on x86_64 and 159 MB on arm64. The planned `scour:browser` image adds Chromium and Xvfb. The installed Chromium of the browser spike is 437 MB. For the planned browser tier on a Linux host, the user installs Chrome and Xvfb and sets the path of Chrome. | Docker, static musl binary | `scour` built for x86_64 and arm64, `scour:browser` planned |
 
 ## Data
 
@@ -313,12 +313,17 @@ flowchart LR
      `webpki-roots` through `wreq`.
   4. **Zig.** BoringSSL (`btls-sys` 0.5.6) needs `cmake`, `git`, `libclang` and a C++ standard library.
      Debian's `musl-tools` supplies no musl C++ toolchain. The Alpine musl Rust image could not load `libclang`
-     in spike #1. Zig supplies musl C and C++ toolchains and supports the planned arm64 cross-build.
+     in spike #1. Zig supplies the musl C and C++ toolchains used to build the static x86_64 and aarch64 binaries.
   5. **Static build check.** The Zig build produces a static binary of about 12.9 MB.
      `scour serve --help` shows `--config` as the only daemon option.
   6. **Stage layout.** The `runtime` stage supplies the files and entrypoint used by the final `scour` stage.
      The planned `browser` target will also extend `runtime`, before the final `scour` stage. A build with
      `--target browser` will select the browser image. A default build produces the plain image.
+  7. **Multi-arch.** The build stage runs on `$BUILDPLATFORM` and selects the Zig archive with `BUILDARCH`.
+     It selects the Rust target with `TARGETARCH` and places the binary at `/build/scour` for the runtime stage.
+     Both selections stop the build for unsupported architectures. During a cross-build, only the runtime package
+     setup runs under QEMU. Compiling Rust and BoringSSL under QEMU takes much longer. One Dockerfile per
+     architecture would duplicate the runtime stages. The planned release workflow will check arm64 in CI.
 
 ## Unknowns
 
