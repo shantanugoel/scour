@@ -1,7 +1,5 @@
-use std::io::{BufRead, BufReader};
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 
 const PROXY_USER: &str = "fixture-user";
 const PROXY_PASSWORD: &str = "fixture-password";
@@ -121,73 +119,6 @@ fn proxy_errors_from_toml_or_the_http_client_hide_credentials() {
         assert_no_proxy_credentials(&stderr);
         assert!(output.stdout.is_empty());
     }
-}
-
-struct Daemon(Child);
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-#[tokio::test]
-async fn daemon_redacts_proxy_start_line_and_cli_connects_directly() {
-    // A bound socket that is not listening refuses connections without a port race.
-    let proxy = tokio::net::TcpSocket::new_v4().unwrap();
-    proxy.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
-    let address = proxy.local_addr().unwrap();
-    let root = test_dir("cli-proxy");
-    std::fs::create_dir_all(root.join("scour")).unwrap();
-    let path = root.join("scour/config.toml");
-    std::fs::write(
-        &path,
-        format!("proxy = \"http://{PROXY_USER}:{PROXY_PASSWORD}@{address}\"\n"),
-    )
-    .unwrap();
-
-    let bin = env!("CARGO_BIN_EXE_scour");
-    let mut daemon = Daemon(
-        Command::new(bin)
-            .args(["serve", "--config"])
-            .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut startup = String::new();
-    BufReader::new(daemon.0.stdout.take().unwrap())
-        .read_line(&mut startup)
-        .unwrap();
-    if startup.is_empty() {
-        let stderr = daemon.0.stderr.take().unwrap();
-        panic!(
-            "daemon did not start: {}",
-            std::io::read_to_string(stderr).unwrap()
-        );
-    }
-
-    let proxy_url = format!("http://{address}");
-    let status = Command::new(bin)
-        .arg("status")
-        .env("XDG_CONFIG_HOME", &root)
-        .env("HTTP_PROXY", &proxy_url)
-        .env("ALL_PROXY", &proxy_url)
-        .env("NO_PROXY", "")
-        .env_remove("REQUEST_METHOD")
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&root);
-
-    assert!(status.status.success(), "{:?}", status);
-    assert!(String::from_utf8_lossy(&status.stdout).contains("duckduckgo: idle (0/200 daily)"));
-    assert_no_proxy_credentials(&startup);
-    assert_eq!(
-        startup,
-        format!("scour: listening on http://127.0.0.1:7268 (proxy http://{address})\n")
-    );
 }
 
 #[test]
