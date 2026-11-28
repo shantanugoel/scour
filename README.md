@@ -113,8 +113,23 @@ When a deadline appears, `scour status` also prints the remaining time.
    docker run -d --name scour -p 127.0.0.1:7268:7268 scour
    ```
 
-The x86_64 image is about 138 MB and contains the HTTP engines.
+The image contains the HTTP engines. It is about 138 MB on x86_64 and 159 MB on arm64.
 Use `http://127.0.0.1:7268` on the host to reach the daemon.
+
+On arm64, `docker build -t scour .` builds natively. On x86_64, enable arm64 emulation through `binfmt`
+before using the following build command.
+
+```sh
+docker build --platform linux/arm64 -t scour:arm64 .
+```
+
+Copy the static aarch64 binary from `scour:arm64` into the current directory with `docker cp`.
+
+```sh
+container=$(docker create --platform linux/arm64 scour:arm64)
+docker cp "$container:/usr/local/bin/scour" .
+docker rm "$container"
+```
 
 Using `-p 7268:7268` exposes the daemon to the LAN. Other containers on the same Docker network can reach the
 daemon even when the published port uses host loopback. If you run other containers, create a separate network
