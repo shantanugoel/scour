@@ -96,8 +96,8 @@ flowchart LR
   By default, each engine starts with three tokens and refills one every 120 seconds, up to three.
   Each engine defaults to 100 requests per 24 hours. The `[limits]` keys `burst`, `refill_seconds` and `daily`
   set the same values for every enabled engine. Duration keys use positive whole numbers and end in their unit.
-  The 30-second cap and the 10-second engine timeout fit within the CLI's 45-second wait.
   If the next token is more than 30 seconds or one refill interval away, the engine reports `limited` with `ready_at`.
+  The 30-second cap and the 10-second engine timeout fit within the CLI's 45-second wait.
   Otherwise, admission reserves the token and adds the request to the daily count. It releases the lock before any wait.
   If rest begins during the wait, the daemon cancels the send and refunds its daily reservation.
   Failed sends count. At the daily limit, `ready_at` is the oldest request's admission time plus 24 hours.
