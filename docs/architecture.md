@@ -38,7 +38,7 @@ flowchart LR
 | Daemon | Serves the JSON API and MCP on `127.0.0.1:7268` only. One layer rejects every request with a foreign `Host` or `Origin`. | `tokio`, `axum` | built |
 | MCP endpoint | Serves streamable HTTP at `/mcp`. It has one tool, `search(query, engines?)`. The answer carries the `GET /search` JSON as `structuredContent`, the `scour search` text as `content[0].text`, and `isError` when no engine is `ok` or `empty`. The optional `engines` list selects the engines and the method of each engine for one query (refer to "Data → Search result"). The tool description warns that titles and snippets are untrusted web text. Planned: the answer shows the open challenges. | `rmcp` (streamable HTTP, stateless JSON) | built |
 | JSON API and CLI | `scour search "q"` uses `GET /search`. `scour status` uses `GET /status` to read engine health without sending an engine request. `GET /search` accepts the same `engines` list as MCP, and `scour search --engines duckduckgo,bing@http "q"` sends it. | `axum`, `wreq` | built |
-| Parallel HTTP search | Starts one task per enabled engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
+| Parallel HTTP search | Starts one task per selected engine in a `JoinSet`. Each task checks its engine's limits before it sends a request. Search reports every engine state in config order and merges the results round-robin. | `tokio` | built |
 | Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. It checks the whole list before it sends any engine request. The `http` method exists. Planned: the cascade sends `browser` engines through the browser tier. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | built for `http`; browser tier planned |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is planned as a browser-only engine. In the saved Google result page, each result link is an opaque `/goto?url=` token, and the token does not contain the target URL as text. The `<cite>` text is not a full URL either. How the Google engine gets the target URL is an open question in `docs/vision.md`. Planned: each engine has two methods, `http` and `browser`. The struct keeps one `request_url` and one `read`. `profile` becomes `http: Option<wreq_util::Profile>`, and `None` means the engine has no `http` method (Google). The `browser` method loads the same `request_url` in a tab and runs the same `read` on the HTML of the page after the load. `read` can also give `Page::Challenge(kind)` for a challenge page. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo and Bing; `browser` method planned |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
@@ -147,12 +147,14 @@ flowchart LR
 - **Configuration.** One TOML file holds the enabled engines. The default path is `$XDG_CONFIG_HOME/scour/config.toml`,
   or `$HOME/.config/scour/config.toml`. The `engines` key is a list; it defaults to `["duckduckgo"]`, and a person
   can add `bing`. `scour serve --config <path>` reads another file. Invalid TOML stops the daemon with exit code 1.
-  Planned: an item can set the default method, as in `["duckduckgo", "bing@browser", "google"]`. A bare name
-  uses `http`, or `browser` for an engine with no `http` method (Google). The same exit code applies to
-  `google@http`, to `bing` with `bing@browser`, and to a `browser` item when the browser tier is off.
+  An item is `<name>` or `<name>@<method>`, as in `["duckduckgo", "bing@http"]`. A bare name uses `http`, the
+  only method that scour runs today. A bad item stops startup with exit code 1: an unknown engine name, an
+  unknown method such as `@ftp`, or a duplicate name. A duplicate name fails also when the methods differ, as in
+  `["bing", "bing@http"]`. Planned: the browser tier runs `@browser` items, and Google has only the `browser`
+  method. Today an `@browser` item stops startup with exit code 1 and a message that names `--browser`.
   `[testing.base_urls]` applies to both methods.
-  The same exit code applies to an unknown key, an unknown or duplicate engine name, an empty list, or a missing
-  `--config` file. A TOML error shows a redacted parser message and the line number.
+  The same exit code applies to an unknown key, an empty list, or a missing `--config` file. A TOML error shows a
+  redacted parser message and the line number.
   The optional `proxy` key accepts an HTTP, SOCKS5, or SOCKS5H URL.
   The URL has no path, query, or fragment, apart from a bare trailing `/`.
   An invalid proxy URL stops startup with exit code 1. The start line shows only the proxy scheme, host and port.
@@ -251,8 +253,9 @@ flowchart LR
   of a scraping service.
 - **Health from the response status and body.** A DuckDuckGo challenge can arrive with HTTP 200 or 202.
   The explicit no-results marker lets the DuckDuckGo reader report `parse_failed` when result markup changes.
-- **The method of each engine comes from the config or the query (planned).** The config sets the default method.
-  An agent can set `@browser` or `@http` for one query. Google has only the `browser` method.
+- **The method of each engine comes from the config or the query.** The config sets the default method.
+  An agent can set `@http` for one query. Planned: an agent can set `@browser`, and Google has only the
+  `browser` method.
   - Reason: Bing over plain HTTP gave 0 of 238 matching results, and Google has no `http` method. A person can
     send an engine through the browser when its HTTP answers are bad. In headful Chrome, Bing was not stable:
     spike #31 got Turnstile and then off-topic results, and spike #32 got results on 6 of 6 queries.
@@ -267,7 +270,7 @@ flowchart LR
   Bing limits.
   - We did not keep a state for each method. With it, `bing@browser` could go around a Bing rest. That is the
     same as the rejected automatic switch, done by hand.
-- **`name@method` items (planned).** One flat list of strings is the same in the config, `GET /search` and MCP.
+- **`name@method` items.** One flat list of strings is the same in the config, `GET /search` and MCP.
   The name `engines` and the comma list in `GET /search` follow SearXNG. `@` cannot occur in an engine name.
   - We did not use objects such as `{name, method}`, because they make the list longer for each agent call.
   - A bad item stops the whole query, and no engine request goes out. We did not report it as an engine `error`.

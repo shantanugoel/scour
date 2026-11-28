@@ -42,7 +42,8 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
 
    Only the `http` method exists today. An item with `@browser` fails, because the browser tier is not built.
    An item can name only an engine that the config enables. The same list works in
-   `GET /search?engines=duckduckgo` and in the MCP `engines` argument.
+   `GET /search?q=<text>&engines=duckduckgo` and in the MCP `engines` argument, which is a JSON array, as in
+   `"engines": ["duckduckgo@http"]`.
 
 3. Check engine status without sending a search.
 
