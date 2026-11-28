@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::http::{StatusCode, header};
@@ -95,6 +95,29 @@ async fn http_block_rests_the_browser_method_without_starting_chrome() {
     assert_eq!(requests.load(Ordering::Relaxed), 1);
     daemon.assert_empty_root();
     daemon.stop(libc::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn a_bad_certificate_gives_error() {
+    let _displays = DISPLAYS.lock().await;
+    let tls = TlsFixture::start().await;
+    let mut daemon = TestDaemon::start_url(
+        'c',
+        "duckduckgo@browser",
+        format!("https://{}", tls.address),
+        0,
+        None,
+    )
+    .await;
+    let response = daemon.search(None).await;
+    assert_eq!(
+        response.engines[0].state,
+        EngineState::Error,
+        "{response:?}"
+    );
+    assert!(response.engines[0].error.is_some(), "{response:?}");
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
 }
 
 #[tokio::test]
@@ -230,15 +253,23 @@ impl TestDaemon {
         port: u16,
         endpoint: Option<&str>,
     ) -> Self {
+        Self::start_url(label, engine, format!("http://{address}"), port, endpoint).await
+    }
+
+    async fn start_url(
+        label: char,
+        engine: &str,
+        base_url: String,
+        port: u16,
+        endpoint: Option<&str>,
+    ) -> Self {
         // Chrome builds a Unix socket path under TMPDIR, which must fit in sun_path.
         let root = PathBuf::from(format!("/tmp/s{:x}{label}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("b")).unwrap();
         fs::write(
             root.join("config.toml"),
-            format!(
-                "engines = [\"{engine}\"]\n[testing.base_urls]\nduckduckgo = \"http://{address}\"\n"
-            ),
+            format!("engines = [\"{engine}\"]\n[testing.base_urls]\nduckduckgo = \"{base_url}\"\n"),
         )
         .unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -264,7 +295,7 @@ exec sleep 60
         let mut daemon = Self {
             root,
             child: command.spawn().unwrap(),
-            address,
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         };
         daemon.address = poll("daemon address", Duration::from_secs(10), || {
             assert!(
@@ -325,6 +356,86 @@ impl Drop for TestDaemon {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+struct TlsFixture {
+    root: PathBuf,
+    child: Child,
+    address: SocketAddr,
+}
+
+impl TlsFixture {
+    async fn start() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = PathBuf::from(format!("/tmp/t{:x}-{nanos}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let cert = root.join("cert.pem");
+        let key = root.join("key.pem");
+        let generated = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("cannot run openssl");
+        assert!(generated.success(), "openssl could not make a certificate");
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut child = Command::new("openssl")
+            .args(["s_server", "-accept"])
+            .arg(format!("127.0.0.1:{}", address.port()))
+            .arg("-cert")
+            .arg(&cert)
+            .arg("-key")
+            .arg(&key)
+            .args(["-www", "-quiet"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cannot run openssl s_server");
+        poll("the certificate server", Duration::from_secs(5), || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "openssl s_server exited"
+            );
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+                .ok()
+                .map(|_| ())
+        })
+        .await;
+        Self {
+            root,
+            child,
+            address,
+        }
+    }
+}
+
+impl Drop for TlsFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.root);
     }
 }

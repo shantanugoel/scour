@@ -1,3 +1,63 @@
 #!/bin/sh
-exec docker run --rm --pid=host --network=none --user "$(id -u):$(id -g)" \
-    -v /tmp:/tmp scour-check-xvfb Xvfb "$@"
+set -u
+
+name="scour-check-xvfb-$$-$(date +%s%N)"
+
+clean() {
+    if docker inspect "$name" >/dev/null 2>&1; then
+        docker stop --time 5 "$name" >/dev/null 2>&1 || true
+    fi
+    docker rm -f "$name" >/dev/null 2>&1 || true
+}
+
+# The daemon can SIGKILL this script. A watcher in its own session then stops the
+# container, which still lets Xvfb remove its socket on SIGTERM.
+watch='parent=$1
+name=$2
+while kill -0 "$parent" 2>/dev/null; do sleep 0.2; done
+i=0
+while [ "$i" -lt 25 ]; do
+    if docker inspect "$name" >/dev/null 2>&1; then
+        docker stop --time 5 "$name" >/dev/null 2>&1 || true
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        exit 0
+    fi
+    sleep 0.2
+    i=$((i + 1))
+done'
+if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c "$watch" sh "$$" "$name" &
+else
+    sh -c "$watch" sh "$$" "$name" &
+fi
+watcher=$!
+
+pid=
+stop() {
+    trap - HUP INT TERM EXIT
+    if [ -n "$pid" ]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 40 ]; do
+            sleep 0.05
+            i=$((i + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+    clean
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    exit 143
+}
+trap stop HUP INT TERM
+trap 'status=$?; clean; kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; exit $status' EXIT
+
+docker run --rm --name "$name" --pid=host --network=none --user "$(id -u):$(id -g)" \
+    -v /tmp:/tmp scour-check-xvfb Xvfb "$@" &
+pid=$!
+status=0
+wait "$pid" || status=$?
+exit "$status"

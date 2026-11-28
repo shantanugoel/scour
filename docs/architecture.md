@@ -55,7 +55,8 @@ flowchart LR
   Chrome must announce the fixed endpoint at `127.0.0.1:7269`.
   Omitting `--remote-allow-origins` keeps Chrome's default Origin checks.
 - Query tabs share one CDP browser context. Its cache, history, cookies and storage stay in memory.
-  Chrome starts with a temporary profile and a blank tab. Its `TMPDIR` is inside the same run directory.
+  Chrome starts with a temporary profile and a blank tab. The run directory is under `/tmp`, because Chrome's
+  process-singleton socket path must fit the kernel's Unix socket limit. Its `TMPDIR` is inside that directory.
 - Ctrl-C, SIGTERM, server errors and failed starts release the resources the daemon acquired.
   The daemon kills Chrome's process group, deletes the run directory, stops Xvfb with SIGTERM, and releases the lock.
   It sends SIGKILL if Xvfb takes more than five seconds to stop.
@@ -105,8 +106,9 @@ flowchart LR
   If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 - **Request limits.** Each engine HTTP request has a 10-second timeout and a limit of 10 redirects.
   The CLI waits up to 45 seconds for a response from the daemon.
-  A browser page has a 10-second timeout. The first query also allows 10 seconds each for Xvfb and Chrome to start.
-  Planned: a total browser budget that includes the wait for a free tab. A timeout gives `error`.
+  A browser page has a 10-second timeout. The first query also allows 30 seconds each for Xvfb and Chrome to start,
+  because a cold CI start took more than 10 seconds.
+  Planned: a total browser budget (#44) that includes the wait for a free tab. A timeout gives `error`.
 - **Pace and daily limits.** Admission checks active rest first, then the rolling daily limit, then pace.
   By default, each engine starts with three tokens and refills one every 120 seconds, up to three.
   Each engine defaults to 100 requests per 24 hours. The `[limits]` keys `burst`, `refill_seconds` and `daily`
@@ -227,8 +229,9 @@ flowchart LR
     CDP still creates tabs in the disk-backed default context. Cache flags leave history and other files on disk.
   - The daemon owns the X lock because `-displayfd` turns off Xvfb's lock. It checks abstract sockets on the
     host because Docker's network namespace hides them from the test Xvfb.
-  - Chrome's private `TMPDIR` lets the run-directory guard clean up its `org.chromium.Chromium.*` directory
-    after SIGKILL.
+  - The run directory is under `/tmp`, and Chrome's private `TMPDIR` is inside it. This keeps the
+    process-singleton socket path short and lets the run-directory guard clean up its
+    `org.chromium.Chromium.*` directory after SIGKILL.
   - Chrome uses `--password-store=basic` and `--use-mock-keychain` because Chromium can hang on the system keyring.
   - We did not use a separate `scour-browser` worker with a JSON protocol on stdin, because that protocol has only
     one user. A move to a worker later stays cheap, because all browser code is behind `fetch`.
@@ -325,7 +328,7 @@ flowchart LR
      the daemon and one forwarder. A Rust forwarding command would put a configurable non-loopback listener in
      every build.
   2. **Tini.** As PID 1, `scour` would ignore SIGTERM. Tini forwards SIGTERM to the daemon and reaps orphaned
-     children. A shell trap does not reliably reap orphans. The planned browser tier also needs this for Chrome and
+     children. A shell trap does not reliably reap orphans. The planned browser image also needs this for Chrome and
      Xvfb. Tini is built into the image so the run command needs no `--init` flag.
   3. **Debian slim.** The planned browser image can install Debian Chromium and Xvfb, as in spikes #15 and #37.
      The Debian base is about 116 MB, compared with about 14 MB for Alpine. The binary uses CA roots from
@@ -334,7 +337,7 @@ flowchart LR
      Debian's `musl-tools` supplies no musl C++ toolchain. The Alpine musl Rust image could not load `libclang`
      in spike #1. Zig supplies the musl C and C++ toolchains used to build the static x86_64 and aarch64 binaries.
   5. **Static build check.** The Zig build produces a static binary of about 12.9 MB on x86_64 and 11.8 MB on aarch64.
-     `scour serve --help` shows `--config` as the only daemon option.
+     `scour serve --help` shows only `--config`, `--browser` and `--help`. It has no port option.
   6. **Stage layout.** The `runtime` stage supplies the files and entrypoint used by the final `scour` stage.
      The planned `browser` target will also extend `runtime`, before the final `scour` stage. A build with
      `--target browser` will select the browser image. A default build produces the plain image.

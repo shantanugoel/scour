@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chromiumoxide::Browser as CdpBrowser;
 use chromiumoxide::detection::{DetectionOptions, default_executable};
 use chromiumoxide::error::CdpError;
+use chromiumoxide::handler::HandlerConfig;
 use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{Mutex, oneshot};
@@ -25,6 +26,10 @@ use crate::search::TIMEOUT;
 pub const CDP_PORT: u16 = 7269;
 const POLL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const XVFB_START: Duration = Duration::from_secs(30);
+const CHROME_START: Duration = Duration::from_secs(30);
+// Chrome appends this to TMPDIR, and sun_path holds 108 bytes including the NUL.
+const CHROME_TMP_SUFFIX: &str = "/org.chromium.Chromium.XXXXXX/SingletonSocket";
 
 pub struct BrowserSettings {
     pub cdp_port: u16,
@@ -35,7 +40,8 @@ impl BrowserSettings {
     pub fn fixed() -> Self {
         Self {
             cdp_port: CDP_PORT,
-            root: std::env::temp_dir(),
+            // A deep TMPDIR overflows Chrome's process-singleton socket path.
+            root: PathBuf::from("/tmp"),
         }
     }
 }
@@ -102,7 +108,7 @@ impl Browser {
                 CdpError::ChromeMessage(_) => format!("cannot connect to {host}"),
                 _ => cdp_error(err),
             })?;
-            let snapshot = page.evaluate("({status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0, html: document.documentElement.outerHTML})")
+            let snapshot = page.evaluate(r#"({status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0, html: document.documentElement?.outerHTML ?? ""})"#)
                 .await.map_err(cdp_error)?;
             snapshot.into_value().map_err(|_| "cannot read Chrome's rendered page".to_string())
         }).await;
@@ -139,7 +145,7 @@ impl Session {
         let run = RunDir::new(&settings.root)?;
         let mut chrome;
         let dir = &run.0;
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + XVFB_START;
         let (n, lock) = DisplayLock::reserve()?;
         display_lock = lock;
         let display = format!(":{n}");
@@ -172,14 +178,14 @@ impl Session {
             }
         })
         .await
-        .map_err(|_| "Xvfb did not start in 10 s")??;
+        .map_err(|_| format!("Xvfb did not start in {} s", XVFB_START.as_secs()))??;
 
         let executable = default_executable(DetectionOptions {
             msedge: false,
             unstable: false,
         })
         .map_err(|_| "cannot find Chrome; set CHROME or install chromium")?;
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + CHROME_START;
         let mut profile_arg = OsString::from("--user-data-dir=");
         profile_arg.push(dir.join("profile"));
         let mut command = Command::new(executable);
@@ -240,7 +246,8 @@ async fn connect(
                 .map_while(Result::ok)
                 .find_map(|line| {
                     let line = std::str::from_utf8(&line).ok()?.trim();
-                    Some(line.strip_prefix("DevTools listening on ")?.to_owned())
+                    let (_, url) = line.split_once("DevTools listening on ")?;
+                    Some(url.to_owned())
                 });
             let _ = send.send(url);
             let _ = io::copy(&mut stderr, &mut io::sink());
@@ -261,7 +268,7 @@ async fn connect(
         }
     })
     .await
-    .map_err(|_| "Chrome did not open CDP in 10 s")??;
+    .map_err(|_| format!("Chrome did not open CDP in {} s", CHROME_START.as_secs()))??;
 
     let invalid = "Chrome returned an invalid CDP URL";
     let (authority, id) = url
@@ -282,13 +289,21 @@ async fn connect(
             "Chrome opened CDP at {address}, expected 127.0.0.1:{port}"
         ));
     }
-    let (mut cdp, mut stream) = timeout_at(deadline, CdpBrowser::connect(url))
+    // The default ignores certificate errors; search pages must verify TLS.
+    let config = HandlerConfig {
+        ignore_https_errors: false,
+        ..Default::default()
+    };
+    let (mut cdp, mut stream) = timeout_at(deadline, CdpBrowser::connect_with_config(url, config))
         .await
         .ok()
         .and_then(Result::ok)
         .ok_or_else(|| format!("cannot connect to Chrome over CDP at {address}"))?;
     let mut handler = JoinSet::new();
-    handler.spawn(async move { while stream.next().await.is_some() {} });
+    handler.spawn(async move {
+        // A fatal handler error closes its channels, so pending calls fail at once.
+        while matches!(stream.next().await, Some(Ok(()))) {}
+    });
     // CDP-created tabs use the default profile unless we set a query context.
     timeout_at(deadline, cdp.start_incognito_context())
         .await
@@ -343,7 +358,15 @@ impl RunDir {
             .create(&path)
             .map_err(failed)?;
         let dir = Self(path);
-        fs::create_dir(dir.0.join("tmp")).map_err(failed)?;
+        let tmp = dir.0.join("tmp");
+        // The kernel limit is 108 bytes including the NUL terminator.
+        if tmp.as_os_str().len() + CHROME_TMP_SUFFIX.len() > 107 {
+            return Err(format!(
+                "cannot use the browser directory {}: the path is too long for Chrome",
+                dir.0.display()
+            ));
+        }
+        fs::create_dir(&tmp).map_err(failed)?;
         Ok(dir)
     }
 }

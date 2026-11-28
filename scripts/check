@@ -12,6 +12,13 @@ if ! command -v Xvfb >/dev/null 2>&1; then
     docker build -q -t scour-check-xvfb scripts/xvfb-docker
     export PATH="$PWD/scripts/xvfb-docker:$PATH"
 fi
+if docker info >/dev/null 2>&1; then
+    scripts/xvfb-docker/check
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+    echo 'scripts/check: the browser tests need openssl for the certificate fixture' >&2
+    exit 1
+fi
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked

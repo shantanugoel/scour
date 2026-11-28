@@ -30,8 +30,9 @@ A scenario:
    uses it.
 5. The agent gets the results, and the state of each engine. If each engine rests, the agent gets no results, the
    state `blocked`, and the time when the engine is ready again.
-6. The owner starts the daemon with the planned `--browser` flag. The daemon can then ask Google through Chrome
-   on a virtual display. The owner or the agent can also send another engine, such as DuckDuckGo, through Chrome.
+6. The owner starts the daemon with `--browser`. The daemon can then send an engine, such as DuckDuckGo, through
+   headful Chrome on a virtual display. Google through the browser is planned. The owner or the agent can also
+   send any enabled engine through Chrome.
 7. Google shows a CAPTCHA. The daemon gives the calling agent a live link to that browser on `127.0.0.1`, and the
    agent passes it to a person.
 8. The person opens the link, through an SSH tunnel from another computer, and solves the CAPTCHA. The agent
@@ -50,16 +51,16 @@ The first useful version lets a person or an agent do these things:
 - An agent can search the web through MCP over HTTP, and get results from DuckDuckGo, the default cheap HTTP
   engine. A person can turn on Bing. Brave and Mojeek are planned as opt-in engines.
   scour merges the results when two or more engines answer.
-- A planned `engines` argument will let an agent select the engines for one query, and the method of each
-  engine: HTTP or the browser (for example, `duckduckgo@browser`). The config sets the default method.
+- An `engines` argument lets an agent select the engines for one query, and the method of each engine:
+  HTTP or the browser (for example, `duckduckgo@browser`). The config sets the default method.
 - A person can start one daemon (`scour serve`) that all agents on the machine share, and can search from the CLI.
   A person who runs scour on a server can send the engine requests through one proxy.
 - An agent can see the state of each engine (`ok`, `empty`, `blocked`, `limited`, `parse_failed`, `error`).
   When an engine rests, the agent gets `blocked` and the time when the engine is ready again.
-- The planned `--browser` flag will start the browser tier. A person can then turn on Google, and send any other
-  engine through the browser. The tier will use headful Chrome on a virtual display (Xvfb).
-  Chrome will run in a separate process. A person will be able to connect to another Chrome instance through a CDP URL.
-- The planned browser tier will let a person solve a CAPTCHA through a live link that the agent passes on.
+- The `--browser` flag starts the browser tier. A person can send any enabled engine through the browser.
+  The tier uses headful Chrome on a virtual display (Xvfb). Chrome runs in a separate process.
+  Google through the browser is planned. A CDP URL from a person is planned.
+- The planned CAPTCHA handoff will let a person solve a CAPTCHA through a live link that the agent passes on.
   A person can open the link on the machine that runs scour, or from another computer through an SSH tunnel.
 
 Planned for a later milestone: an agent can fetch one page as Markdown. A person can connect an external CAPTCHA

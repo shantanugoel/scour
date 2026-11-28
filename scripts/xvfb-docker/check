@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/../.."
+
+if ! docker info >/dev/null 2>&1; then
+    echo 'scripts/xvfb-docker/check: Docker is not available' >&2
+    exit 1
+fi
+docker image inspect scour-check-xvfb >/dev/null 2>&1 \
+    || docker build -q -t scour-check-xvfb scripts/xvfb-docker >/dev/null
+
+work=$(mktemp -d)
+shim=$PWD/scripts/xvfb-docker/Xvfb
+before=$(docker ps -aq --filter 'name=^/scour-check-xvfb-' | sort || true)
+created_displays=
+trap 'rm -rf "$work"; for n in $created_displays; do rm -f "/tmp/.X$n-lock" "/tmp/.X11-unix/X$n"; done' EXIT
+
+fail() {
+    echo "scripts/xvfb-docker/check: $1" >&2
+    docker ps -a --filter 'name=^/scour-check-xvfb-' >&2 || true
+    cat "$work"/error-* >&2 2>/dev/null || true
+    exit 1
+}
+
+names() {
+    docker ps -aq --filter 'name=^/scour-check-xvfb-' | sort || true
+}
+
+no_new_container() {
+    [ "$(names)" = "$before" ]
+}
+
+new_container() {
+    [ "$(names)" != "$before" ]
+}
+
+socket_up() {
+    [ -e "/tmp/.X11-unix/X$display" ]
+}
+
+socket_gone() {
+    [ ! -e "/tmp/.X11-unix/X$display" ] && [ ! -e "/tmp/.X$display-lock" ]
+}
+
+poll() {
+    what=$1
+    check=$2
+    i=0
+    while ! "$check"; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "timed out waiting for $what"
+        sleep 0.1
+    done
+}
+
+free_display() {
+    n=90
+    while [ "$n" -lt 100 ]; do
+        if [ ! -e "/tmp/.X11-unix/X$n" ] && [ ! -e "/tmp/.X$n-lock" ]; then
+            created_displays="$created_displays $n"
+            echo "$n"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    fail 'no free display from :90 to :99'
+}
+
+run_shim() {
+    display=$1
+    "$shim" ":$display" -displayfd 1 -screen 0 640x480x24 -nolisten tcp \
+        >"$work/display-$display" 2>"$work/error-$display" &
+    child=$!
+}
+
+clean_after() {
+    what=$1
+    poll "the container to go after $what" no_new_container
+    poll "the X socket to go after $what" socket_gone
+}
+
+# A normal stop lets Xvfb remove its own socket.
+display=$(free_display)
+run_shim "$display"
+poll 'the Xvfb socket' socket_up
+kill -TERM "$child"
+wait "$child" 2>/dev/null || true
+clean_after SIGTERM
+
+# SIGKILL cannot run the shell trap. The watcher must stop the container cleanly.
+display=$(free_display)
+run_shim "$display"
+poll 'the Xvfb socket' socket_up
+poll 'the container to start' new_container
+kill -KILL "$child"
+wait "$child" 2>/dev/null || true
+clean_after SIGKILL
+
+# A signal before the container starts must not leave a created container.
+display=$(free_display)
+run_shim "$display"
+kill -TERM "$child"
+wait "$child" 2>/dev/null || true
+clean_after 'SIGTERM during start'

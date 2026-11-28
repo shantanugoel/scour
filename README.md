@@ -110,7 +110,7 @@ Install Chrome or Chromium and put `Xvfb` on `PATH`. Set `CHROME` to the executa
 
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
 A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
-Use a short `TMPDIR`, such as `/tmp`, so Chrome's Unix socket path fits.
+The daemon keeps the temporary profile under `/tmp`, because Chrome's Unix socket path has a length limit.
 Stop the daemon with Ctrl-C or SIGTERM to close Chrome and Xvfb and delete the temporary profile.
 
 ## Docker
@@ -249,8 +249,9 @@ Each engine still uses its normal search path and query parameters.
 
 ## Check
 
-Install Chrome or Chromium, and either Xvfb or Docker. If `Xvfb` is absent from `PATH`, the first run builds
-the `scour-check-xvfb` Docker image. You can run the check while `scour serve --browser` has Chrome open.
+Install Chrome or Chromium, `openssl`, and either Xvfb or Docker. If `Xvfb` is absent from `PATH`, the first run
+builds the `scour-check-xvfb` Docker image. If Docker is available, the check also tests that shim.
+You can run the check while `scour serve --browser` has Chrome open.
 
 ```sh
 scripts/check
