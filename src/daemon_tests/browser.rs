@@ -115,7 +115,11 @@ async fn a_bad_certificate_gives_error() {
         EngineState::Error,
         "{response:?}"
     );
-    assert!(response.engines[0].error.is_some(), "{response:?}");
+    let error = response.engines[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("cannot connect to 127.0.0.1"),
+        "{response:?}"
+    );
     daemon.stop(libc::SIGTERM).await;
     daemon.assert_empty_root();
 }
