@@ -57,7 +57,10 @@ async fn daemon_redacts_proxy_start_line_and_cli_connects_directly() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("duckduckgo: idle (0/200 daily)"));
+    assert!(
+        stdout.contains("duckduckgo: idle (0/100 daily)"),
+        "{stdout}"
+    );
     assert!(!stdout.contains(USER), "{stdout}");
     assert!(!stdout.contains(PASSWORD), "{stdout}");
     let (listen, proxy) = stdout
