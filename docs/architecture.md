@@ -110,6 +110,9 @@ flowchart LR
 | Safe Browsing real-time lookup key | `www.gstatic.com/ohttp_gateway/hpke_public_keys/v1/sbc_prod` | disable `SafeBrowsingHashPrefixRealTimeLookups` |
 | Preconnect to the default search engine | `https://www.google.com/` | disable `PreconnectToSearch` and `SearchEnginePreconnect2` |
 
+With real-time lookups off, pages get no Safe Browsing check. scour loads only engine URLs that it builds, follows no
+result link and downloads no file, so this costs nothing.
+
 - The forwarder accepts only `CONNECT`. It resolves a name with `tokio::net::lookup_host` and keeps the
   first IPv4 address. An IPv4 literal connects as given. A name with no IPv4 address gets reply 4, and an
   IPv6 literal gets reply 8. The accept task owns the connection tasks in a `JoinSet`, so stopping the
@@ -117,7 +120,7 @@ flowchart LR
 - A failed forwarder bind stops the start with `cannot start the IPv4 forwarder: {err}` and cleans the run
   directory.
 - A browser page error gives one of these messages:
-  - A configured proxy refused the connection (`ERR_PROXY_CONNECTION_FAILED`):
+  - Chrome cannot connect to the configured proxy (`ERR_PROXY_CONNECTION_FAILED`):
     `cannot connect to the proxy`.
   - A proxy that cannot reach the host: `the proxy cannot connect to {host}`.
   - No proxy, and no IPv4 address or a failed IPv4 connection: `cannot connect to {host} over IPv4`.

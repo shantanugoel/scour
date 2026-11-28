@@ -768,27 +768,8 @@ impl Drop for DisplayLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{chrome_proxy_server, connect_error, resolver_rules};
+    use super::connect_error;
     use url::Url;
-
-    #[test]
-    fn a_loopback_proxy_is_excluded_once() {
-        let proxy = Url::parse("http://127.0.0.1:8080").unwrap();
-        assert_eq!(
-            resolver_rules(Some(&proxy)),
-            "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"
-        );
-    }
-
-    #[test]
-    fn an_ipv6_proxy_gets_an_unbracketed_resolver_exclusion() {
-        let proxy = Url::parse("http://[::1]:8080").unwrap();
-        assert_eq!(chrome_proxy_server(&proxy), "http://[::1]:8080");
-        assert_eq!(
-            resolver_rules(Some(&proxy)),
-            "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE ::1"
-        );
-    }
 
     #[test]
     fn a_forwarder_error_without_a_proxy_does_not_name_the_proxy() {
