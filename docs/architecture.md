@@ -314,7 +314,7 @@ flowchart LR
   4. **Zig.** BoringSSL (`btls-sys` 0.5.6) needs `cmake`, `git`, `libclang` and a C++ standard library.
      Debian's `musl-tools` supplies no musl C++ toolchain. The Alpine musl Rust image could not load `libclang`
      in spike #1. Zig supplies the musl C and C++ toolchains used to build the static x86_64 and aarch64 binaries.
-  5. **Static build check.** The Zig build produces a static binary of about 12.9 MB.
+  5. **Static build check.** The Zig build produces a static binary of about 12.9 MB on x86_64 and 11.8 MB on aarch64.
      `scour serve --help` shows `--config` as the only daemon option.
   6. **Stage layout.** The `runtime` stage supplies the files and entrypoint used by the final `scour` stage.
      The planned `browser` target will also extend `runtime`, before the final `scour` stage. A build with
