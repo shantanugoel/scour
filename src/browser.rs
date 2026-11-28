@@ -247,11 +247,7 @@ impl Session {
                 server
             }
         };
-        let mut resolver = String::from("MAP * ~NOTFOUND , EXCLUDE 127.0.0.1");
-        if let Some(url) = proxy {
-            let host = url.host_str().expect("validated proxy host");
-            resolver.push_str(&format!(" , EXCLUDE {host}"));
-        }
+        let resolver = resolver_rules(proxy);
         let deadline = Instant::now() + CHROME_START;
         let mut profile_arg = OsString::from("--user-data-dir=");
         profile_arg.push(dir.join("profile"));
@@ -275,7 +271,7 @@ impl Session {
                 "--no-default-browser-check",
                 "--disable-extensions",
                 "--disable-background-networking",
-                "--disable-features=AimEnabled,NetworkTimeServiceQuerying,OptimizationHints,PreconnectToSearch,SearchEnginePreconnect2",
+                "--disable-features=AimEnabled,NetworkTimeServiceQuerying,OptimizationHints,PreconnectToSearch,SearchEnginePreconnect2,SafeBrowsingHashPrefixRealTimeLookups",
                 "--enable-features=SkipListAccountsWithoutGaiaCookies",
                 "--disable-sync",
                 "--disable-component-update",
@@ -330,9 +326,31 @@ fn chrome_proxy_server(url: &Url) -> String {
     }
 }
 
+fn resolver_rules(proxy: Option<&Url>) -> String {
+    let mut rules = String::from("MAP * ~NOTFOUND , EXCLUDE 127.0.0.1");
+    if let Some(host) = proxy.map(proxy_host)
+        && host != "127.0.0.1"
+    {
+        rules.push_str(&format!(" , EXCLUDE {host}"));
+    }
+    rules
+}
+
+fn proxy_host(url: &Url) -> String {
+    let host = url.host_str().expect("validated proxy host");
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string()
+}
+
 fn connect_error(text: &str, host: &str, proxied: bool) -> String {
     if text.contains("ERR_PROXY_CONNECTION_FAILED") {
-        "cannot connect to the proxy".to_string()
+        if proxied {
+            "cannot connect to the proxy".to_string()
+        } else {
+            format!("cannot connect to {host}")
+        }
     } else if text.contains("ERR_SOCKS_CONNECTION_FAILED")
         || (proxied && text.contains("ERR_TUNNEL_CONNECTION_FAILED"))
     {
@@ -745,5 +763,43 @@ impl DisplayLock {
 impl Drop for DisplayLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chrome_proxy_server, connect_error, resolver_rules};
+    use url::Url;
+
+    #[test]
+    fn a_loopback_proxy_is_excluded_once() {
+        let proxy = Url::parse("http://127.0.0.1:8080").unwrap();
+        assert_eq!(
+            resolver_rules(Some(&proxy)),
+            "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_proxy_gets_an_unbracketed_resolver_exclusion() {
+        let proxy = Url::parse("http://[::1]:8080").unwrap();
+        assert_eq!(chrome_proxy_server(&proxy), "http://[::1]:8080");
+        assert_eq!(
+            resolver_rules(Some(&proxy)),
+            "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE ::1"
+        );
+    }
+
+    #[test]
+    fn a_forwarder_error_without_a_proxy_does_not_name_the_proxy() {
+        let text = "net::ERR_PROXY_CONNECTION_FAILED";
+        assert_eq!(
+            connect_error(text, "engine.test", false),
+            "cannot connect to engine.test"
+        );
+        assert_eq!(
+            connect_error(text, "engine.test", true),
+            "cannot connect to the proxy"
+        );
     }
 }

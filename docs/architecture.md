@@ -88,13 +88,13 @@ flowchart LR
 - The command line covers the query context and browser-wide services. A per-context
   `CreateBrowserContext` proxy covers only the query context, so background requests would still go direct.
   We use Chrome's own proxy code and not a chained forwarder to the config proxy. A chained forwarder would
-  add about 100 lines of proxy-client code, turn plain HTTP targets into `CONNECT` tunnels that many proxies
-  refuse off port 443, and report a stopped proxy as a forwarder SOCKS error.
+  add about 100 lines of proxy-client code. It would turn plain HTTP targets into `CONNECT` tunnels that many
+  proxies refuse off port 443. It would also report a stopped proxy as a forwarder SOCKS error.
 - `--proxy-bypass-list=<-loopback>` sends loopback targets through the proxy too. Chrome still reaches the
   proxy or forwarder at `127.0.0.1`.
 - `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1` stops every other name from resolving in
-  Chrome. With a proxy, the rule also excludes the proxy host, or a proxy given by name cannot resolve.
-  A request that skips the proxy cannot connect.
+  Chrome. With a proxy on another host, the rule also excludes that host. Without the exclusion, a proxy
+  given by name cannot resolve. A request that skips the proxy cannot connect.
 - Chrome rejects `socks5h://` with `ERR_NO_SUPPORTED_PROXIES`. Its `socks5://` sends the host name to the
   proxy, so scour passes `socks5h://` as `socks5://`. The proxy resolves the engine host name.
 - A proxy with a user name or a password stops `--browser` with exit code 1. The message has no part of
@@ -107,6 +107,7 @@ flowchart LR
 | AI Mode eligibility | `www.google.com/async/folae` | disable `AimEnabled` |
 | Optimization Guide models | `optimizationguide-pa.googleapis.com/v1:GetModels` | disable `OptimizationHints` |
 | Network time | `clients2.google.com/time/1/current` | disable `NetworkTimeServiceQuerying` |
+| Safe Browsing real-time lookup key | `www.gstatic.com/ohttp_gateway/hpke_public_keys/v1/sbc_prod` | disable `SafeBrowsingHashPrefixRealTimeLookups` |
 | Preconnect to the default search engine | `https://www.google.com/` | disable `PreconnectToSearch` and `SearchEnginePreconnect2` |
 
 - The forwarder accepts only `CONNECT`. It resolves a name with `tokio::net::lookup_host` and keeps the
@@ -116,7 +117,8 @@ flowchart LR
 - A failed forwarder bind stops the start with `cannot start the IPv4 forwarder: {err}` and cleans the run
   directory.
 - A browser page error gives one of these messages:
-  - `ERR_PROXY_CONNECTION_FAILED`: `cannot connect to the proxy`.
+  - A configured proxy refused the connection (`ERR_PROXY_CONNECTION_FAILED`):
+    `cannot connect to the proxy`.
   - A proxy that cannot reach the host: `the proxy cannot connect to {host}`.
   - No proxy, and no IPv4 address or a failed IPv4 connection: `cannot connect to {host} over IPv4`.
     Chrome gives `ERR_SOCKS_CONNECTION_FAILED` for every forwarder reply code.

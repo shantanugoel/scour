@@ -6,10 +6,14 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
+
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 pub struct Forwarder {
     pub port: u16,
@@ -25,12 +29,16 @@ pub async fn start() -> io::Result<Forwarder> {
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let Ok((client, _)) = accepted else {
-                        break;
-                    };
-                    connections.spawn(handle(client));
-                }
+                accepted = listener.accept() => match accepted {
+                    Ok((client, _)) => {
+                        connections.spawn(handle(client));
+                    }
+                    Err(err) => match accept_retry(&err) {
+                        Some(pause) if !pause.is_zero() => sleep(pause).await,
+                        Some(_) => {}
+                        None => break,
+                    },
+                },
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
@@ -39,6 +47,22 @@ pub async fn start() -> io::Result<Forwarder> {
         port,
         _tasks: tasks,
     })
+}
+
+fn accept_retry(err: &io::Error) -> Option<Duration> {
+    match err.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => Some(ACCEPT_PAUSE),
+        _ if matches!(
+            err.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::WouldBlock
+        ) =>
+        {
+            Some(Duration::ZERO)
+        }
+        _ => None,
+    }
 }
 
 async fn handle(mut client: TcpStream) -> io::Result<()> {
@@ -121,4 +145,29 @@ async fn ipv4_lookup(host: &str, port: u16) -> Option<SocketAddr> {
 
 async fn reply(client: &mut TcpStream, status: u8) -> io::Result<()> {
     client.write_all(&[5, status, 0, 1, 0, 0, 0, 0, 0, 0]).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACCEPT_PAUSE, accept_retry};
+    use std::io;
+    use std::time::Duration;
+
+    #[test]
+    fn a_resource_shortage_pauses_and_keeps_accepting() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                accept_retry(&io::Error::from_raw_os_error(code)),
+                Some(ACCEPT_PAUSE)
+            );
+        }
+        assert_eq!(
+            accept_retry(&io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            accept_retry(&io::Error::from_raw_os_error(libc::EBADF)),
+            None
+        );
+    }
 }

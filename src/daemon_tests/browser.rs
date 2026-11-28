@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -106,10 +106,7 @@ async fn a_bad_certificate_gives_error() {
         'c',
         "duckduckgo@browser",
         format!("https://{}", tls.address),
-        0,
-        None,
-        None,
-        None,
+        StartOptions::default(),
     )
     .await;
     let response = daemon.search(None).await;
@@ -138,10 +135,10 @@ async fn the_browser_sends_queries_and_background_traffic_through_the_proxy() {
             'y',
             "duckduckgo@browser",
             format!("http://engine.scour.test:{}", engine.port()),
-            0,
-            None,
-            None,
-            Some(&extra),
+            StartOptions {
+                extra: Some(&extra),
+                ..Default::default()
+            },
         )
         .await;
         assert_rendered(daemon.search(None).await);
@@ -161,6 +158,35 @@ async fn the_browser_sends_queries_and_background_traffic_through_the_proxy() {
 }
 
 #[tokio::test]
+async fn an_ipv6_proxy_reaches_the_engine() {
+    let _displays = DISPLAYS.lock().await;
+    let engine = fixture_server().await;
+    let proxy = test_proxy_on(Ipv6Addr::LOCALHOST.into(), ProxyKind::Http, engine).await;
+    let extra = format!("proxy = \"http://{}\"", proxy.address);
+    let mut daemon = TestDaemon::start_url(
+        '6',
+        "duckduckgo@browser",
+        format!("http://engine.scour.test:{}", engine.port()),
+        StartOptions {
+            extra: Some(&extra),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_rendered(daemon.search(None).await);
+    let targets = proxy.targets.lock().await.clone();
+    assert!(!targets.is_empty(), "{targets:?}");
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.starts_with("engine.scour.test:")),
+        "{targets:?}"
+    );
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
+#[tokio::test]
 async fn a_stopped_proxy_gives_error_and_no_direct_request() {
     let _displays = DISPLAYS.lock().await;
     let requests = Arc::new(AtomicUsize::new(0));
@@ -177,16 +203,16 @@ async fn a_stopped_proxy_gives_error_and_no_direct_request() {
     let proxy = tokio::net::TcpSocket::new_v4().unwrap();
     proxy.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let proxy_address = proxy.local_addr().unwrap();
-    drop(proxy);
+    let _proxy = proxy;
     let extra = format!("proxy = \"http://{proxy_address}\"");
     let mut daemon = TestDaemon::start_url(
         'z',
         "duckduckgo@browser",
         format!("http://{engine}"),
-        0,
-        None,
-        None,
-        Some(&extra),
+        StartOptions {
+            extra: Some(&extra),
+            ..Default::default()
+        },
     )
     .await;
     let response = daemon.search(None).await;
@@ -223,10 +249,7 @@ async fn with_no_proxy_chrome_connects_to_engines_over_ipv4() {
         'w',
         "duckduckgo@browser",
         format!("http://localhost:{}", engine.port()),
-        0,
-        None,
-        None,
-        None,
+        StartOptions::default(),
     )
     .await;
     assert_rendered(daemon.search(None).await);
@@ -240,10 +263,7 @@ async fn with_no_proxy_chrome_connects_to_engines_over_ipv4() {
         'v',
         "duckduckgo@browser",
         format!("http://[::1]:{}", engine.port()),
-        0,
-        None,
-        None,
-        None,
+        StartOptions::default(),
     )
     .await;
     let response = daemon.search(None).await;
@@ -699,6 +719,14 @@ struct TestDaemon {
     endpoint: Option<String>,
 }
 
+#[derive(Default)]
+struct StartOptions<'a> {
+    port: u16,
+    endpoint: Option<&'a str>,
+    idle: Option<u32>,
+    extra: Option<&'a str>,
+}
+
 impl TestDaemon {
     async fn start(
         label: char,
@@ -711,10 +739,11 @@ impl TestDaemon {
             label,
             engine,
             format!("http://{address}"),
-            port,
-            endpoint,
-            None,
-            None,
+            StartOptions {
+                port,
+                endpoint,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -731,23 +760,26 @@ impl TestDaemon {
             label,
             engine,
             format!("http://{address}"),
-            port,
-            endpoint,
-            Some(idle),
-            None,
+            StartOptions {
+                port,
+                endpoint,
+                idle: Some(idle),
+                ..Default::default()
+            },
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn start_url(
         label: char,
         engine: &str,
         base_url: String,
-        port: u16,
-        endpoint: Option<&str>,
-        idle: Option<u32>,
-        extra: Option<&str>,
+        StartOptions {
+            port,
+            endpoint,
+            idle,
+            extra,
+        }: StartOptions<'_>,
     ) -> Self {
         // Chrome builds a Unix socket path under TMPDIR, which must fit in sun_path.
         let root = PathBuf::from(format!("/tmp/s{:x}{label}", std::process::id()));
@@ -1041,11 +1073,15 @@ async fn serve(app: Router) -> SocketAddr {
 }
 
 async fn dual_stack_fixture() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-    let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let address = ipv4.local_addr().unwrap();
-    let ipv6 = TcpListener::bind((Ipv6Addr::LOCALHOST, address.port()))
-        .await
-        .unwrap();
+    let (ipv4, address, ipv6) = loop {
+        let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = ipv4.local_addr().unwrap();
+        match TcpListener::bind((Ipv6Addr::LOCALHOST, address.port())).await {
+            Ok(ipv6) => break (ipv4, address, ipv6),
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(err) => panic!("cannot bind the IPv6 fixture: {err}"),
+        }
+    };
     let ipv4_requests = Arc::new(AtomicUsize::new(0));
     let ipv6_requests = Arc::new(AtomicUsize::new(0));
     let ipv4_app = Router::new().route(
@@ -1095,7 +1131,11 @@ struct TestProxy {
 }
 
 async fn test_proxy(kind: ProxyKind, target: SocketAddr) -> TestProxy {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    test_proxy_on(Ipv4Addr::LOCALHOST.into(), kind, target).await
+}
+
+async fn test_proxy_on(bind: IpAddr, kind: ProxyKind, target: SocketAddr) -> TestProxy {
+    let listener = TcpListener::bind((bind, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let targets = Arc::new(Mutex::new(Vec::new()));
     let log = targets.clone();
@@ -1170,19 +1210,20 @@ async fn http_proxy(
         if line.is_empty() {
             break;
         }
-        if line
-            .split_once(':')
-            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("proxy-connection"))
-        {
+        if line.split_once(':').is_some_and(|(name, _)| {
+            name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("proxy-connection")
+        }) {
             continue;
         }
         request.push_str(line);
         request.push_str("\r\n");
     }
-    request.push_str("\r\n");
+    // Close the upstream connection after one response, so Chrome logs every request
+    // on a new proxy connection.
+    request.push_str("Connection: close\r\n\r\n");
     let mut upstream = TcpStream::connect(target).await?;
     upstream.write_all(request.as_bytes()).await?;
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    let _ = tokio::io::copy(&mut upstream, &mut client).await;
     Ok(())
 }
 
@@ -1259,23 +1300,31 @@ async fn read_request_head(client: &mut TcpStream) -> io::Result<Vec<u8>> {
 }
 
 fn assert_chrome_tcp_peers_are_loopback(group: i32) {
+    // Collect the inodes first. A later /proc/net read then includes every socket
+    // that Chrome had when its process group was scanned.
+    let inodes: Vec<_> = group_pids(group)
+        .into_iter()
+        .flat_map(|pid| {
+            socket_inodes(pid)
+                .into_iter()
+                .map(move |inode| (pid, inode))
+        })
+        .collect();
     let sockets = tcp_sockets();
     let mut checked = 0;
-    for pid in group_pids(group) {
-        for inode in socket_inodes(pid) {
-            let Some((peer, state)) = sockets.get(&inode) else {
-                continue;
-            };
-            // The CDP listener has no peer.
-            if *state == 0x0a {
-                continue;
-            }
-            assert!(
-                is_loopback_peer(peer),
-                "process {pid} socket {inode} has peer {peer}"
-            );
-            checked += 1;
+    for (pid, inode) in inodes {
+        let Some((peer, state)) = sockets.get(&inode) else {
+            continue;
+        };
+        // The CDP listener has no peer.
+        if *state == 0x0a {
+            continue;
         }
+        assert!(
+            is_loopback_peer(peer),
+            "process {pid} socket {inode} has peer {peer}"
+        );
+        checked += 1;
     }
     assert!(checked > 0, "no TCP sockets in Chrome group {group}");
 }
