@@ -1,12 +1,12 @@
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +16,9 @@ use chromiumoxide::error::CdpError;
 use chromiumoxide::handler::HandlerConfig;
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use url::Url;
 
 use crate::search::TIMEOUT;
@@ -40,8 +40,7 @@ impl BrowserSettings {
     pub fn fixed() -> Self {
         Self {
             cdp_port: CDP_PORT,
-            // A deep TMPDIR overflows Chrome's process-singleton socket path.
-            root: PathBuf::from("/tmp"),
+            root: PathBuf::from(format!("/dev/shm/scour-{}", unsafe { libc::geteuid() })),
         }
     }
 }
@@ -54,7 +53,10 @@ pub struct Rendered {
 
 pub struct Browser {
     settings: BrowserSettings,
-    state: Mutex<State>,
+    idle: Duration,
+    state: Arc<Mutex<State>>,
+    // Drop the browser state before the root lock, so a new daemon cannot clean under a teardown.
+    _root: File,
 }
 
 enum State {
@@ -64,8 +66,10 @@ enum State {
 }
 
 struct Session {
-    _handler: JoinSet<()>,
+    // Dropping this aborts the supervisor and the CDP handler.
+    _supervisor: JoinSet<()>,
     cdp: Arc<CdpBrowser>,
+    last_used: Instant,
     _chrome: Group,
     _dir: RunDir,
     _xvfb: Group,
@@ -73,21 +77,35 @@ struct Session {
 }
 
 impl Browser {
-    pub fn new(settings: BrowserSettings) -> Self {
-        Self {
+    pub fn open(settings: BrowserSettings, idle: Duration) -> Result<Self, String> {
+        let root = open_root(&settings.root)?;
+        Ok(Self {
             settings,
-            state: Mutex::new(State::Idle),
-        }
+            idle,
+            state: Arc::new(Mutex::new(State::Idle)),
+            _root: root,
+        })
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Rendered, String> {
         let cdp = {
-            let mut state = self.state.lock().await;
-            if matches!(*state, State::Idle) {
-                *state = State::Running(Session::start(&self.settings).await?);
+            let mut state = self.state.clone().lock_owned().await;
+            if let State::Running(session) = &mut *state
+                && session.chrome_exited()
+            {
+                end(state, State::Idle).await;
+                state = self.state.clone().lock_owned().await;
             }
-            match &*state {
-                State::Running(session) => session.cdp.clone(),
+            if matches!(*state, State::Idle) {
+                let session =
+                    Session::start(&self.settings, Arc::downgrade(&self.state), self.idle).await?;
+                *state = State::Running(session);
+            }
+            match &mut *state {
+                State::Running(session) => {
+                    session.last_used = Instant::now();
+                    session.cdp.clone()
+                }
                 State::Stopped => return Err("the browser is stopping".into()),
                 State::Idle => unreachable!(),
             }
@@ -123,15 +141,16 @@ impl Browser {
     }
 
     pub async fn stop(&self) {
-        let state = std::mem::replace(&mut *self.state.lock().await, State::Stopped);
-        if let State::Running(session) = state {
-            let _ = tokio::task::spawn_blocking(move || drop(session)).await;
-        }
+        end(self.state.clone().lock_owned().await, State::Stopped).await;
     }
 }
 
 impl Session {
-    async fn start(settings: &BrowserSettings) -> Result<Self, String> {
+    async fn start(
+        settings: &BrowserSettings,
+        state: Weak<Mutex<State>>,
+        idle: Duration,
+    ) -> Result<Self, String> {
         let port = settings.cdp_port;
         if port != 0 {
             TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|err| match err.kind() {
@@ -220,15 +239,196 @@ impl Session {
         chrome = Group::spawn(&mut command, libc::SIGKILL)
             .map_err(|err| format!("cannot start Chrome: {err}"))?;
         let (cdp, handler) = connect(&mut chrome.0, port, deadline).await?;
+        let cdp = Arc::new(cdp);
+        let mut supervisor = JoinSet::new();
+        supervisor.spawn(supervise(state, Arc::downgrade(&cdp), handler, idle));
         Ok(Self {
-            _handler: handler,
-            cdp: Arc::new(cdp),
+            _supervisor: supervisor,
+            cdp,
+            last_used: Instant::now(),
             _chrome: chrome,
             _dir: run,
             _xvfb: xvfb,
             _display: display_lock,
         })
     }
+
+    fn busy(&self) -> bool {
+        // A query holds a clone for as long as it uses the browser.
+        Arc::strong_count(&self.cdp) > 1
+    }
+
+    fn chrome_exited(&mut self) -> bool {
+        self._chrome
+            .0
+            .try_wait()
+            .is_ok_and(|status| status.is_some())
+    }
+}
+
+async fn supervise(
+    state: Weak<Mutex<State>>,
+    cdp: Weak<CdpBrowser>,
+    mut handler: JoinSet<()>,
+    idle: Duration,
+) {
+    loop {
+        let Some(browser) = state.upgrade() else {
+            return;
+        };
+        let deadline = {
+            let state = browser.lock().await;
+            match &*state {
+                State::Running(session) if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp)) => {
+                    session.last_used + idle
+                }
+                _ => return,
+            }
+        };
+        tokio::select! {
+            _ = handler.join_next() => {
+                let Some(browser) = state.upgrade() else {
+                    return;
+                };
+                let guard = browser.lock_owned().await;
+                if matches!(&*guard, State::Running(session) if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp)))
+                {
+                    end(guard, State::Idle).await;
+                }
+                return;
+            }
+            _ = sleep_until(deadline) => {
+                let Some(browser) = state.upgrade() else {
+                    return;
+                };
+                let guard = browser.lock_owned().await;
+                match &*guard {
+                    State::Running(session)
+                        if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp))
+                            && session.busy() =>
+                    {
+                        drop(guard);
+                        sleep_until(Instant::now() + idle).await;
+                        continue;
+                    }
+                    State::Running(session)
+                        if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp))
+                            && session.last_used + idle > Instant::now() =>
+                    {
+                        drop(guard);
+                        continue;
+                    }
+                    State::Running(session)
+                        if Weak::ptr_eq(&cdp, &Arc::downgrade(&session.cdp)) =>
+                    {
+                        end(guard, State::Idle).await;
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+async fn end(mut guard: OwnedMutexGuard<State>, next: State) {
+    let old = std::mem::replace(&mut *guard, next);
+    if let State::Running(session) = old {
+        // Keep the lock until the old session is gone, so a new start never overlaps its teardown.
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(session);
+            drop(guard);
+        })
+        .await;
+    }
+}
+
+fn open_root(path: &Path) -> Result<File, String> {
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(format!(
+                "cannot make the browser directory {}: {err}",
+                path.display()
+            ));
+        }
+    }
+    let meta = fs::symlink_metadata(path)
+        .map_err(|err| format!("cannot use {}: {err}", path.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "cannot use {}: it is not a directory of this user",
+            path.display()
+        ));
+    }
+    let root = File::open(path).map_err(|err| format!("cannot use {}: {err}", path.display()))?;
+    match root.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(format!(
+                "{} is in use by another scour daemon",
+                path.display()
+            ));
+        }
+        Err(TryLockError::Error(err)) => {
+            return Err(format!("cannot lock {}: {err}", path.display()));
+        }
+    }
+    clean_root(path)?;
+    Ok(root)
+}
+
+fn clean_root(root: &Path) -> Result<(), String> {
+    let entries =
+        fs::read_dir(root).map_err(|err| format!("cannot read {}: {err}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("cannot read {}: {err}", root.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if let Some(pid) = name
+            .to_string_lossy()
+            .split_once('-')
+            .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
+            && (pid == std::process::id() as libc::pid_t || !alive(pid))
+        {
+            remove_x_locks(pid);
+        }
+        remove_entry(&path)?;
+    }
+    Ok(())
+}
+
+fn alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return true;
+    }
+    (unsafe { libc::kill(pid, 0) == 0 })
+        || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn remove_x_locks(pid: libc::pid_t) {
+    let owner = format!("{pid:>10}\n");
+    for n in 0..100 {
+        let path = format!("/tmp/.X{n}-lock");
+        if fs::read_to_string(&path).is_ok_and(|text| text == owner) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn remove_entry(path: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("cannot delete {}: {err}", path.display())),
+    };
+    let result = if meta.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|err| format!("cannot delete {}: {err}", path.display()))
 }
 
 async fn connect(
@@ -317,6 +517,20 @@ struct Group(Child, libc::c_int);
 
 impl Group {
     fn spawn(command: &mut Command, stop_signal: libc::c_int) -> io::Result<Self> {
+        let parent = std::process::id() as libc::pid_t;
+        // PDEATHSIG fires when the thread that spawned the child exits. Spawn children only on the
+        // runtime thread: `main` keeps the current_thread runtime, and pool threads retire.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, stop_signal) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
         let child = command.process_group(0).stdin(Stdio::null()).spawn()?;
         Ok(Self(child, stop_signal))
     }
@@ -351,7 +565,7 @@ impl RunDir {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = root.join(format!("scour-browser-{}-{nanos}", std::process::id()));
+        let path = root.join(format!("{}-{nanos}", std::process::id()));
         let failed = |err| format!("cannot make the browser directory: {err}");
         DirBuilder::new()
             .mode(0o700)

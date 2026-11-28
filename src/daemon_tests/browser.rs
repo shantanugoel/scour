@@ -107,6 +107,7 @@ async fn a_bad_certificate_gives_error() {
         format!("https://{}", tls.address),
         0,
         None,
+        None,
     )
     .await;
     let response = daemon.search(None).await;
@@ -310,10 +311,184 @@ async fn google_goes_through_the_browser_and_its_sorry_page_starts_a_rest() {
     daemon.assert_empty_root();
 }
 
+#[tokio::test]
+async fn idle_browser_stop_removes_the_profile_and_starts_a_new_chrome() {
+    let _displays = DISPLAYS.lock().await;
+    let engine = fixture_server().await;
+    let mut daemon = TestDaemon::start_idle('i', "duckduckgo@browser", engine, 0, None, 2).await;
+    assert_rendered(daemon.search(None).await);
+    let run = daemon.run_dir();
+    let (_, group, display, xvfb) = browser_process(&run);
+
+    poll("the idle stop", Duration::from_secs(15), || {
+        fs::read_dir(daemon.browser_root())
+            .unwrap()
+            .next()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(!run.exists(), "{}", run.display());
+    wait_stopped(group, xvfb, &display).await;
+
+    assert_rendered(daemon.search(None).await);
+    assert_ne!(daemon.run_dir(), run);
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
+#[tokio::test]
+async fn chrome_crash_ends_the_session_and_the_next_query_starts_chrome() {
+    let _displays = DISPLAYS.lock().await;
+    let engine = fixture_server().await;
+    let mut daemon = TestDaemon::start('x', "duckduckgo@browser", engine, 0, None).await;
+    assert_rendered(daemon.search(None).await);
+    let run = daemon.run_dir();
+    let (chrome, group, display, xvfb) = browser_process(&run);
+
+    assert_eq!(unsafe { libc::kill(chrome, libc::SIGKILL) }, 0);
+    poll("the crash cleanup", Duration::from_secs(10), || {
+        fs::read_dir(daemon.browser_root())
+            .unwrap()
+            .next()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(!run.exists(), "{}", run.display());
+    wait_stopped(group, xvfb, &display).await;
+
+    assert_rendered(daemon.search(None).await);
+    let crashed = daemon.run_dir();
+    assert_ne!(crashed, run);
+    let (chrome, _, _, _) = browser_process(&crashed);
+    assert_eq!(unsafe { libc::kill(chrome, libc::SIGKILL) }, 0);
+    // SIGKILL takes effect at the next scheduling point; wait for that, not for the idle time.
+    poll("Chrome to die", Duration::from_secs(5), || {
+        (!Path::new(&format!("/proc/{chrome}")).exists()).then_some(())
+    })
+    .await;
+    // A query waits for the teardown under the lock, then starts a new Chrome.
+    assert_rendered(daemon.search(None).await);
+    assert!(!crashed.exists(), "{}", crashed.display());
+    assert_ne!(daemon.run_dir(), crashed);
+
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
+#[tokio::test]
+async fn a_second_daemon_cannot_use_a_running_browser_root() {
+    let _displays = DISPLAYS.lock().await;
+    let engine = fixture_server().await;
+    let mut daemon = TestDaemon::start('l', "duckduckgo@browser", engine, 0, None).await;
+    assert_rendered(daemon.search(None).await);
+    let run = daemon.run_dir();
+
+    let second = start_daemon(
+        Some(&daemon.root.join("config.toml")),
+        (Ipv4Addr::LOCALHOST, 0).into(),
+        Some(BrowserSettings {
+            cdp_port: 0,
+            root: daemon.browser_root(),
+        }),
+    )
+    .await;
+    let error = second.err().expect("the second daemon must not start");
+    assert!(
+        error.contains(&format!(
+            "{} is in use by another scour daemon",
+            daemon.browser_root().display()
+        )),
+        "{error}"
+    );
+    assert!(run.is_dir(), "{}", run.display());
+    assert_rendered(daemon.search(None).await);
+
+    daemon.stop(libc::SIGTERM).await;
+    daemon.assert_empty_root();
+}
+
+#[tokio::test]
+async fn daemon_kill_stops_its_browser_and_the_next_start_cleans_the_root() {
+    let _displays = DISPLAYS.lock().await;
+    let engine = fixture_server().await;
+    // Give a runner with no desktop an occupied socket path and lock to preserve.
+    let _socket = ExistingX::create("/tmp/.X11-unix/X0");
+    let _lock = ExistingX::create("/tmp/.X1-lock");
+    let before = x_inodes();
+
+    // Kill during the start, while fake Chrome waits for announce.
+    let mut daemon = TestDaemon::start('k', "duckduckgo@browser", engine, 0, Some("unused")).await;
+    let request = tokio::spawn(search(daemon.address, None));
+    let (chrome, display) = poll("fake Chrome to start", Duration::from_secs(15), || {
+        let line = fs::read_to_string(daemon.root.join("fake")).ok()?;
+        let (pid, display) = line.trim().split_once(" :")?;
+        Some((pid.parse().ok()?, display.to_string()))
+    })
+    .await;
+    let group = unsafe { libc::getpgid(chrome) };
+    assert!(group > 0);
+    let xvfb = xvfb_pid(&display);
+    let shim = shim_pid(&display);
+    let run = daemon.run_dir();
+    let lock = format!("/tmp/.X{display}-lock");
+    let owner = fs::read_to_string(&lock).unwrap();
+    assert_eq!(owner, format!("{:>10}\n", daemon.child.id()));
+
+    request.abort();
+    daemon.kill().await;
+    wait_processes_stopped(group, xvfb, &display).await;
+    if let Some(shim) = shim {
+        assert_no_shim_container(shim).await;
+    }
+    assert!(run.is_dir(), "{}", run.display());
+    assert_eq!(fs::read_to_string(&lock).unwrap(), owner);
+    assert_inodes(&before);
+
+    daemon.restart().await;
+    daemon.assert_empty_root();
+    assert!(
+        !Path::new(&lock).exists(),
+        "the start-up cleanup removed the X lock"
+    );
+    assert_inodes(&before);
+    daemon.stop(libc::SIGTERM).await;
+
+    // Kill after a real query.
+    let mut daemon = TestDaemon::start('q', "duckduckgo@browser", engine, 0, None).await;
+    assert_rendered(daemon.search(None).await);
+    let run = daemon.run_dir();
+    let (_, group, display, xvfb) = browser_process(&run);
+    let shim = shim_pid(&display);
+    let lock = format!("/tmp/.X{display}-lock");
+    let owner = fs::read_to_string(&lock).unwrap();
+
+    daemon.kill().await;
+    wait_processes_stopped(group, xvfb, &display).await;
+    if let Some(shim) = shim {
+        assert_no_shim_container(shim).await;
+    }
+    assert!(run.is_dir(), "{}", run.display());
+    assert_eq!(fs::read_to_string(&lock).unwrap(), owner);
+    assert_inodes(&before);
+
+    daemon.restart().await;
+    daemon.assert_empty_root();
+    assert!(
+        !Path::new(&lock).exists(),
+        "the start-up cleanup removed the X lock"
+    );
+    assert_inodes(&before);
+    daemon.stop(libc::SIGTERM).await;
+}
+
 struct TestDaemon {
     root: PathBuf,
     child: Child,
     address: SocketAddr,
+    cdp_port: u16,
+    endpoint: Option<String>,
 }
 
 impl TestDaemon {
@@ -324,7 +499,34 @@ impl TestDaemon {
         port: u16,
         endpoint: Option<&str>,
     ) -> Self {
-        Self::start_url(label, engine, format!("http://{address}"), port, endpoint).await
+        Self::start_url(
+            label,
+            engine,
+            format!("http://{address}"),
+            port,
+            endpoint,
+            None,
+        )
+        .await
+    }
+
+    async fn start_idle(
+        label: char,
+        engine: &str,
+        address: SocketAddr,
+        port: u16,
+        endpoint: Option<&str>,
+        idle: u32,
+    ) -> Self {
+        Self::start_url(
+            label,
+            engine,
+            format!("http://{address}"),
+            port,
+            endpoint,
+            Some(idle),
+        )
+        .await
     }
 
     async fn start_url(
@@ -333,22 +535,24 @@ impl TestDaemon {
         base_url: String,
         port: u16,
         endpoint: Option<&str>,
+        idle: Option<u32>,
     ) -> Self {
         // Chrome builds a Unix socket path under TMPDIR, which must fit in sun_path.
         let root = PathBuf::from(format!("/tmp/s{:x}{label}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("b")).unwrap();
         let name = engine.split('@').next().unwrap();
+        let browser = idle
+            .map(|seconds| format!("[browser]\nidle_seconds = {seconds}\n"))
+            .unwrap_or_default();
         fs::write(
             root.join("config.toml"),
-            format!("engines = [\"{engine}\"]\n[testing.base_urls]\n{name} = \"{base_url}\"\n"),
+            format!(
+                "engines = [\"{engine}\"]\n{browser}[testing.base_urls]\n{name} = \"{base_url}\"\n"
+            ),
         )
         .unwrap();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "daemon_tests::browser::signal_shutdown_reaps_chrome_and_preserves_existing_x_displays", "--nocapture"])
-            .env(CHILD_ROOT, &root).env(CHILD_PORT, port.to_string())
-            .stdout(Stdio::null());
-        if let Some(endpoint) = endpoint {
+        if endpoint.is_some() {
             let chrome = root.join("chrome");
             fs::write(
                 &chrome,
@@ -362,25 +566,63 @@ exec sleep 60
             )
             .unwrap();
             fs::set_permissions(&chrome, fs::Permissions::from_mode(0o700)).unwrap();
-            command.env("CHROME", chrome).env(CHILD_ENDPOINT, endpoint);
         }
+        let child = Self::command(&root, port, endpoint).spawn().unwrap();
         let mut daemon = Self {
             root,
-            child: command.spawn().unwrap(),
+            child,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            cdp_port: port,
+            endpoint: endpoint.map(str::to_string),
         };
-        daemon.address = poll("daemon address", Duration::from_secs(10), || {
+        daemon.address = daemon.wait_address().await;
+        daemon
+    }
+
+    fn command(root: &Path, port: u16, endpoint: Option<&str>) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "daemon_tests::browser::signal_shutdown_reaps_chrome_and_preserves_existing_x_displays", "--nocapture"])
+            .env(CHILD_ROOT, root).env(CHILD_PORT, port.to_string())
+            .stdout(Stdio::null());
+        if let Some(endpoint) = endpoint {
+            command
+                .env("CHROME", root.join("chrome"))
+                .env(CHILD_ENDPOINT, endpoint);
+        }
+        command
+    }
+
+    async fn wait_address(&mut self) -> SocketAddr {
+        poll("daemon address", Duration::from_secs(10), || {
             assert!(
-                daemon.child.try_wait().unwrap().is_none(),
+                self.child.try_wait().unwrap().is_none(),
                 "daemon exited at startup"
             );
-            fs::read_to_string(daemon.root.join("address"))
+            fs::read_to_string(self.root.join("address"))
                 .ok()?
                 .parse()
                 .ok()
         })
+        .await
+    }
+
+    async fn restart(&mut self) {
+        let _ = fs::remove_file(self.root.join("address"));
+        self.child = Self::command(&self.root, self.cdp_port, self.endpoint.as_deref())
+            .spawn()
+            .unwrap();
+        self.address = self.wait_address().await;
+    }
+
+    async fn kill(&mut self) {
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGKILL) },
+            0
+        );
+        poll("daemon to die", Duration::from_secs(10), || {
+            self.child.try_wait().unwrap()
+        })
         .await;
-        daemon
     }
 
     async fn search(&self, selection: Option<&str>) -> SearchResponse {
@@ -727,16 +969,54 @@ fn xvfb_pid(display: &str) -> i32 {
     })
 }
 
+fn browser_process(run: &Path) -> (i32, i32, String, i32) {
+    let profile = format!("--user-data-dir={}", run.join("profile").display());
+    let chrome = find_pid(|args| {
+        args.contains(&profile.as_str()) && !args.iter().any(|arg| arg.starts_with("--type="))
+    });
+    let group = unsafe { libc::getpgid(chrome) };
+    assert!(group > 0);
+    let display = fs::read_to_string(run.join("display"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let xvfb = xvfb_pid(&display);
+    (chrome, group, display, xvfb)
+}
+
+fn processes_stopped(chrome: i32, xvfb: i32, display: &str) -> bool {
+    let group_gone = unsafe { libc::kill(-chrome, 0) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    group_gone
+        && !Path::new(&format!("/proc/{xvfb}")).exists()
+        && !Path::new(&format!("/tmp/.X11-unix/X{display}")).exists()
+}
+
+async fn wait_processes_stopped(chrome: i32, xvfb: i32, display: &str) {
+    poll(
+        "the browser processes to stop",
+        Duration::from_secs(10),
+        || processes_stopped(chrome, xvfb, display).then_some(()),
+    )
+    .await;
+}
+
+async fn wait_stopped(chrome: i32, xvfb: i32, display: &str) {
+    wait_processes_stopped(chrome, xvfb, display).await;
+    let lock = format!("/tmp/.X{display}-lock");
+    poll("the X lock to go", Duration::from_secs(5), || {
+        fs::symlink_metadata(&lock)
+            .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+            .then_some(())
+    })
+    .await;
+    assert_stopped(chrome, xvfb, display);
+}
+
 fn assert_stopped(chrome: i32, xvfb: i32, display: &str) {
-    assert_eq!(
-        unsafe { libc::kill(-chrome, 0) },
-        -1,
-        "Chrome group {chrome} remains"
-    );
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     assert!(
-        !Path::new(&format!("/proc/{xvfb}")).exists(),
-        "Xvfb {xvfb} remains"
+        processes_stopped(chrome, xvfb, display),
+        "Chrome group {chrome} or Xvfb {xvfb} remains"
     );
     for path in [
         format!("/tmp/.X{display}-lock"),
@@ -748,4 +1028,51 @@ fn assert_stopped(chrome: i32, xvfb: i32, display: &str) {
             "{path}"
         );
     }
+}
+
+fn shim_pid(display: &str) -> Option<i32> {
+    let display = format!(":{display}");
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse() else {
+            continue;
+        };
+        let Ok(line) = fs::read_to_string(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<_> = line
+            .split(|c: char| c == '\0' || c.is_ascii_whitespace())
+            .filter(|arg| !arg.is_empty())
+            .collect();
+        if args.iter().any(|arg| arg.ends_with("xvfb-docker/Xvfb"))
+            && args.contains(&display.as_str())
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn shim_containers(xvfb: i32) -> Option<Vec<String>> {
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("name=^/scour-check-xvfb-{xvfb}-"),
+        ])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+async fn assert_no_shim_container(xvfb: i32) {
+    poll("the shim container to go", Duration::from_secs(10), || {
+        shim_containers(xvfb).filter(Vec::is_empty).map(|_| ())
+    })
+    .await;
 }

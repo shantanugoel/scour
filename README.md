@@ -126,8 +126,14 @@ The `/sorry/` page gives `blocked`, and changed result markup gives `parse_faile
 
 Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
 A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
-The daemon keeps the temporary profile under `/tmp`, because Chrome's Unix socket path has a length limit.
-Stop the daemon with Ctrl-C or SIGTERM to close Chrome and Xvfb and delete the temporary profile.
+The daemon keeps the temporary profile in `/dev/shm/scour-<uid>`, a memory-backed directory with mode `0700`.
+It deletes everything in that directory at start. This also needs no deep `TMPDIR`, because Chrome's
+Unix socket path has a length limit.
+The daemon stops Chrome and Xvfb after 90 minutes without a browser query. Set `[browser] idle_seconds` to
+change this time. A `kill -9` of the daemon also stops Chrome and Xvfb. The next `scour serve --browser`
+deletes the left-over profile before the first query. Stop the daemon with Ctrl-C or SIGTERM to close Chrome
+and Xvfb and delete the temporary profile. The default 64 MiB of `/dev/shm` in Docker is enough; the profile
+used 6.1 MiB after 60 pages.
 
 ## Docker
 
@@ -253,6 +259,16 @@ daily = 100
 Use whole numbers from 1 to 1000 for `burst`, 1 to 86400 for `refill_seconds`, and 1 to 4294967295 for `daily`.
 For an invalid value, the daemon exits with code 1 and names the key without showing its value.
 An unknown key or an engine subtable such as `[limits.google]` also stops startup with exit code 1.
+
+Use `[browser] idle_seconds` to set the idle stop for Chrome. This example shows the default of 90 minutes.
+
+```toml
+[browser]
+idle_seconds = 5400
+```
+
+Use a whole number of seconds from 1 to 86400. An invalid value exits with code 1 and names the key.
+The key loads with or without `--browser`.
 
 For local testing, set a positive base rest duration in seconds and point enabled engines at test servers.
 

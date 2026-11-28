@@ -222,20 +222,32 @@ fn invalid_testing_settings_exit_one_without_echoing_values() {
 
 #[test]
 fn invalid_limits_exit_one_with_the_key_and_without_the_value() {
-    for (key, max, description) in [
-        ("burst", "1001", "a whole number from 1 to 1000"),
+    for (section, key, max, description) in [
+        ("limits", "burst", "1001", "a whole number from 1 to 1000"),
         (
+            "limits",
             "refill_seconds",
             "86401",
             "a whole number of seconds from 1 to 86400",
         ),
-        ("daily", "4294967296", "a whole number from 1 to 4294967295"),
+        (
+            "limits",
+            "daily",
+            "4294967296",
+            "a whole number from 1 to 4294967295",
+        ),
+        (
+            "browser",
+            "idle_seconds",
+            "86401",
+            "a whole number of seconds from 1 to 86400",
+        ),
     ] {
         for value in ["0", "-1", r#""fixture-value""#, "1.5", max] {
-            let path = config_file("invalid-limits", &format!("[limits]\n{key} = {value}\n"));
+            let path = config_file("invalid-limits", &format!("[{section}]\n{key} = {value}\n"));
             let output = serve_with_config(&path);
             std::fs::remove_file(&path).unwrap();
-            let expected = format!("limits.{key} must be {description}");
+            let expected = format!("{section}.{key} must be {description}");
             let stderr = assert_exit_one(&output, &expected);
             assert_eq!(stderr.trim(), format!("scour: {expected}"));
             assert!(output.stdout.is_empty());
