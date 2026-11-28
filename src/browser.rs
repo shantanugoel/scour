@@ -23,6 +23,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use url::Url;
 
 use crate::search::TIMEOUT;
+use crate::socks::Forwarder;
 
 pub const CDP_PORT: u16 = 7269;
 const POLL: Duration = Duration::from_millis(50);
@@ -55,6 +56,7 @@ pub struct Rendered {
 pub struct Browser {
     settings: BrowserSettings,
     idle: Duration,
+    proxy: Option<Url>,
     state: Arc<Mutex<State>>,
     // Drop the browser state before the root lock, so a new daemon cannot clean under a teardown.
     _root: File,
@@ -72,17 +74,23 @@ struct Session {
     cdp: Arc<CdpBrowser>,
     last_used: Instant,
     _chrome: Group,
+    _forwarder: Option<Forwarder>,
     _dir: RunDir,
     _xvfb: Group,
     _display: DisplayLock,
 }
 
 impl Browser {
-    pub fn open(settings: BrowserSettings, idle: Duration) -> Result<Self, String> {
+    pub fn open(
+        settings: BrowserSettings,
+        idle: Duration,
+        proxy: Option<Url>,
+    ) -> Result<Self, String> {
         let root = open_root(&settings.root)?;
         Ok(Self {
             settings,
             idle,
+            proxy,
             state: Arc::new(Mutex::new(State::Idle)),
             _root: root,
         })
@@ -90,6 +98,7 @@ impl Browser {
 
     pub async fn fetch(&self, url: &Url) -> Result<Rendered, String> {
         let host = url.host_str().unwrap_or("the engine");
+        let proxied = self.proxy.is_some();
         let slow = || format!("no answer from {host} in {} s", TIMEOUT.as_secs());
         let cdp_error = |err| match err {
             CdpError::Timeout => slow(),
@@ -107,9 +116,13 @@ impl Browser {
                 }
                 let started = matches!(*state, State::Idle);
                 if started {
-                    let session =
-                        Session::start(&self.settings, Arc::downgrade(&self.state), self.idle)
-                            .await?;
+                    let session = Session::start(
+                        &self.settings,
+                        Arc::downgrade(&self.state),
+                        self.idle,
+                        self.proxy.as_ref(),
+                    )
+                    .await?;
                     *state = State::Running(session);
                 }
                 match &mut *state {
@@ -140,7 +153,7 @@ impl Browser {
         };
         let rendered = timeout_at(deadline, async {
             page.goto(url.as_str()).await.map_err(|err| match err {
-                CdpError::ChromeMessage(_) => format!("cannot connect to {host}"),
+                CdpError::ChromeMessage(text) => connect_error(&text, host, proxied),
                 _ => cdp_error(err),
             })?;
             let snapshot = page.evaluate(r#"({status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0, html: document.documentElement?.outerHTML ?? ""})"#)
@@ -167,6 +180,7 @@ impl Session {
         settings: &BrowserSettings,
         state: Weak<Mutex<State>>,
         idle: Duration,
+        proxy: Option<&Url>,
     ) -> Result<Self, String> {
         let port = settings.cdp_port;
         if port != 0 {
@@ -179,6 +193,7 @@ impl Session {
         let display_lock;
         let mut xvfb;
         let run = RunDir::new(&settings.root)?;
+        let mut forwarder = None;
         let mut chrome;
         let dir = &run.0;
         let deadline = Instant::now() + XVFB_START;
@@ -221,6 +236,22 @@ impl Session {
             unstable: false,
         })
         .map_err(|_| "cannot find Chrome; set CHROME or install chromium")?;
+        let proxy_server = match proxy {
+            Some(url) => chrome_proxy_server(url),
+            None => {
+                let started = crate::socks::start()
+                    .await
+                    .map_err(|err| format!("cannot start the IPv4 forwarder: {err}"))?;
+                let server = format!("socks5://127.0.0.1:{}", started.port);
+                forwarder = Some(started);
+                server
+            }
+        };
+        let mut resolver = String::from("MAP * ~NOTFOUND , EXCLUDE 127.0.0.1");
+        if let Some(url) = proxy {
+            let host = url.host_str().expect("validated proxy host");
+            resolver.push_str(&format!(" , EXCLUDE {host}"));
+        }
         let deadline = Instant::now() + CHROME_START;
         let mut profile_arg = OsString::from("--user-data-dir=");
         profile_arg.push(dir.join("profile"));
@@ -234,6 +265,9 @@ impl Session {
             .stderr(Stdio::piped())
             .arg(format!("--remote-debugging-port={port}"))
             .arg(profile_arg)
+            .arg(format!("--proxy-server={proxy_server}"))
+            .arg("--proxy-bypass-list=<-loopback>")
+            .arg(format!("--host-resolver-rules={resolver}"))
             .args([
                 "--no-sandbox",
                 "--remote-debugging-address=127.0.0.1",
@@ -241,6 +275,8 @@ impl Session {
                 "--no-default-browser-check",
                 "--disable-extensions",
                 "--disable-background-networking",
+                "--disable-features=AimEnabled,NetworkTimeServiceQuerying,OptimizationHints,PreconnectToSearch,SearchEnginePreconnect2",
+                "--enable-features=SkipListAccountsWithoutGaiaCookies",
                 "--disable-sync",
                 "--disable-component-update",
                 "--disable-default-apps",
@@ -264,6 +300,7 @@ impl Session {
             cdp,
             last_used: Instant::now(),
             _chrome: chrome,
+            _forwarder: forwarder,
             _dir: run,
             _xvfb: xvfb,
             _display: display_lock,
@@ -280,6 +317,32 @@ impl Session {
             .0
             .try_wait()
             .is_ok_and(|status| status.is_some())
+    }
+}
+
+fn chrome_proxy_server(url: &Url) -> String {
+    let address = crate::config::proxy_address(url);
+    if url.scheme() == "socks5h" {
+        // Chrome rejects socks5h. Its socks5:// sends the host name to the proxy.
+        address.replacen("socks5h://", "socks5://", 1)
+    } else {
+        address
+    }
+}
+
+fn connect_error(text: &str, host: &str, proxied: bool) -> String {
+    if text.contains("ERR_PROXY_CONNECTION_FAILED") {
+        "cannot connect to the proxy".to_string()
+    } else if text.contains("ERR_SOCKS_CONNECTION_FAILED")
+        || (proxied && text.contains("ERR_TUNNEL_CONNECTION_FAILED"))
+    {
+        if proxied {
+            format!("the proxy cannot connect to {host}")
+        } else {
+            format!("cannot connect to {host} over IPv4")
+        }
+    } else {
+        format!("cannot connect to {host}")
     }
 }
 

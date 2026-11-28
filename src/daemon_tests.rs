@@ -169,3 +169,81 @@ async fn cli_engines_option_asks_only_the_named_engine_and_prints_a_bad_item() {
         assert!(stderr.contains(item), "{item}: {stderr}");
     }
 }
+
+#[tokio::test]
+async fn a_proxy_with_credentials_stops_a_browser_start() {
+    const CHILD: &str = "SCOUR_CREDENTIALS_TEST_CHILD";
+    const MODE: &str = "SCOUR_CREDENTIALS_TEST_MODE";
+
+    if std::env::var_os(CHILD).is_some() {
+        let browser = std::env::var(MODE).as_deref() == Ok("browser");
+        let root = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        let browser = browser.then(|| crate::browser::BrowserSettings {
+            cdp_port: 0,
+            root: root.join("b"),
+        });
+        if let Err(message) = start_daemon(None, (Ipv4Addr::LOCALHOST, 0).into(), browser).await {
+            eprintln!("scour: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "scour-test-proxy-credentials-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("scour")).unwrap();
+    for (userinfo, user, password) in [
+        (
+            "fixture-user:fixture-password@",
+            "fixture-user",
+            "fixture-password",
+        ),
+        ("fixture-user@", "fixture-user", ""),
+        (":fixture-password@", "", "fixture-password"),
+    ] {
+        std::fs::write(
+            root.join("scour/config.toml"),
+            format!("proxy = \"http://{userinfo}127.0.0.1:1\"\n"),
+        )
+        .unwrap();
+        for (mode, expected) in [("browser", Some(1)), ("plain", None)] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon_tests::a_proxy_with_credentials_stops_a_browser_start",
+                    "--quiet",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(MODE, mode)
+                .env("XDG_CONFIG_HOME", &root)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            match expected {
+                Some(code) => {
+                    assert_eq!(output.status.code(), Some(code), "{stdout}\n{stderr}");
+                    assert!(
+                        stderr.contains(
+                            "scour: the browser cannot use a proxy with a user name or a password; \
+                             remove them from proxy, or start without --browser"
+                        ),
+                        "{stderr}"
+                    );
+                }
+                None => {
+                    assert!(output.status.success(), "{stdout}\n{stderr}");
+                    assert!(stdout.contains("scour: listening on http://"), "{stdout}");
+                }
+            }
+            for secret in [user, password].into_iter().filter(|part| !part.is_empty()) {
+                assert!(!stdout.contains(secret), "{secret}: {stdout}");
+                assert!(!stderr.contains(secret), "{secret}: {stderr}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

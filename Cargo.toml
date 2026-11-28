@@ -12,7 +12,7 @@ name = "scour"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt", "net", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "net", "time", "signal", "sync", "io-util"] }
 chrono = { version = "0.4", default-features = false, features = ["now"] }
 axum = "0.8"
 wreq = { version = "0.16", features = ["json", "gzip", "brotli", "deflate", "zstd", "socks"] }

@@ -1237,6 +1237,7 @@ bing = "{engine_base}"
                 root: root.clone(),
             },
             Config::default().browser_idle,
+            None,
         )
         .unwrap();
         let searcher = Arc::new(Searcher::new(&config.unwrap(), Some(browser)).unwrap());

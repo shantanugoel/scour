@@ -41,7 +41,7 @@ flowchart LR
 | Cascade | Selects the engines and the method of each engine for a query. The engines come from the query `engines` list, or else from all enabled engines. The method of each engine comes from the query, or else from the config. It checks the whole list before it sends any engine request. The cascade sends `browser` engines through the browser tier when `--browser` is set. It never changes the method of an engine after a block, because a browser on the same IP gets the same block. | Rust | built |
 | Engines | Each engine makes the request URL and parses the page. One `Engine` struct holds the name, base URL, profile, supported methods, URL builder and page reader. Each engine is one file with the same shape. There is no `Engine` trait, because a function pointer is enough for the engines. DuckDuckGo is built as the only default engine. It uses `https://html.duckduckgo.com/html/?q=<q>&kl=us-en`, and it reads the target URL from the `uddg=` parameter of each `/l/` redirect link. Bing is built as an opt-in engine. Brave and Mojeek are planned as opt-in engines. Brave gave 7 good answers, then HTTP 429 on paced query 5, so it may need the browser tier. Mojeek has no saved result page. Google is built as a browser-only engine. It uses `https://www.google.com/search?q=<q>&hl=en&pws=0`. A web result URL is the absolute Google `/goto?url=` redirect, because the result page gives no free target URL. A `/url?q=<target>` link uses the plain target, because it costs no extra request. A video card uses its exact `data-curl` URL when that is an http(s) URL on another site. Each result has a `domain` from the host in `<cite>`, and the field is absent when `<cite>` shows only a date or a count. The `/sorry/` page gives `blocked`, and changed result markup gives `parse_failed`. Both methods use the same `request_url` and `read`. The browser method reads the DOM after the page loads. Planned: `profile` becomes optional for browser-only engines, and `read` can give `Page::Challenge(kind)`. `duckduckgo::read` gave `ok` on 3 of 3 pages from headful Chrome (#31). `bing::read` gives `Page::Challenge(cloudflare)` when the CSS selector `#turnstile-widget` matches. That selector was on 4 of 4 Turnstile pages and on 0 of more than 70 other Bing pages (#31). The current `bing::read` gives `empty` on a Turnstile page. A check for the `challenges.cloudflare.com` host is not a marker, because Bing result pages also load it. Not built: a step that opens the home page and types the query, as `openserp` does for Bing. Spike #31 did not test it. | `scraper` | built for DuckDuckGo, Bing and Google |
 | HTTP tier | Sends the DuckDuckGo and Bing requests with the Chrome TLS profile. Uses IPv4 addresses for hosts it resolves locally. Supports one optional proxy for all engine requests. Google has no HTTP method. | `wreq`, `wreq-util` | built for DuckDuckGo and Bing |
-| Browser tier | Starts one Chrome on Xvfb on the first browser query. `fetch(url)` opens a tab in one shared query context, reads the main document status and rendered HTML, then closes the tab. The CDP port is fixed at `127.0.0.1:7269`. See "Browser lifecycle" below. | `chromiumoxide` 0.9 | built |
+| Browser tier | Starts one Chrome on Xvfb on the first browser query. Every Chrome request uses one command-line proxy: the config proxy, or a local SOCKS5 forwarder that allows IPv4 only. `fetch(url)` opens a tab in one shared query context, reads the main document status and rendered HTML, then closes the tab. The CDP port is fixed at `127.0.0.1:7269`. See "Browser lifecycle" below. | `chromiumoxide` 0.9 | built |
 | Engine state | Each engine tracks its last state, block rest, pace tokens and rolling 24-hour request count. Both methods of an engine share this state. | Rust, in memory | built for DuckDuckGo, Bing and Google |
 | Challenge queue | Keeps each open CAPTCHA with an ID, a screenshot, a live link and an expiry time. One queue serves every `browser` engine: a Google reCAPTCHA and a Bing Turnstile are both challenges. An engine has at most one open challenge, because the challenge starts a rest and the resting engine opens no tab. The live link is the local Chrome inspector of the challenge tab. The agent passes it to a person. A solver plugin is planned for after the first release. The queue watches the tab for the done signal (refer to "Data"). It removes the challenge on the done signal or at expiry. | Rust; CDP target list | planned |
 | Fixtures and canary | Saved DuckDuckGo, Bing and Google pages test the parsers. The Google fixtures are `fixtures/google/results.html` (the #15 page from more than 3 hours after a solve, 8 results), `web-results.html` (the #37 page, 10 results) and `sorry.html`. Planned: `scour canary` sends one query to each engine and prints its health. Also planned: the headful Bing result and Turnstile pages from spike #31 (`fixture-bing-results.html`, `fixture-bing-turnstile.html`). The #31 saver removed inline `<script>` text, so the Turnstile marker test also uses an unchanged #14 result page (`bing-bing-headful-01.html`). | Rust tests | built for DuckDuckGo, Bing and Google |
@@ -78,7 +78,49 @@ flowchart LR
   The daemon kills Chrome's process group, deletes the run directory, stops Xvfb with SIGTERM, and releases the lock.
   It sends SIGKILL if Xvfb takes more than five seconds to stop. A teardown keeps the state lock until the old
   session is gone, so a new start never overlaps it.
-- Browser proxy support, IPv4-only engine connections, tab limits and a user-supplied CDP URL are planned.
+- Tab limits and a user-supplied CDP URL are planned.
+
+### Browser proxy
+
+- Chrome gets one `--proxy-server` on its command line. With `proxy` set, it is the config proxy, and
+  `socks5h://` becomes `socks5://`. Without `proxy`, it is a local SOCKS5 forwarder on `127.0.0.1:0`.
+  The forwarder starts with the session and stops with it.
+- The command line covers the query context and browser-wide services. A per-context
+  `CreateBrowserContext` proxy covers only the query context, so background requests would still go direct.
+  We use Chrome's own proxy code and not a chained forwarder to the config proxy. A chained forwarder would
+  add about 100 lines of proxy-client code, turn plain HTTP targets into `CONNECT` tunnels that many proxies
+  refuse off port 443, and report a stopped proxy as a forwarder SOCKS error.
+- `--proxy-bypass-list=<-loopback>` sends loopback targets through the proxy too. Chrome still reaches the
+  proxy or forwarder at `127.0.0.1`.
+- `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1` stops every other name from resolving in
+  Chrome. With a proxy, the rule also excludes the proxy host, or a proxy given by name cannot resolve.
+  A request that skips the proxy cannot connect.
+- Chrome rejects `socks5h://` with `ERR_NO_SUPPORTED_PROXIES`. Its `socks5://` sends the host name to the
+  proxy, so scour passes `socks5h://` as `socks5://`. The proxy resolves the engine host name.
+- A proxy with a user name or a password stops `--browser` with exit code 1. The message has no part of
+  the URL. The same config starts without `--browser`.
+- `--disable-background-networking` does not stop every background request to Google. These switches do:
+
+| Service | Request | Switch |
+| --- | --- | --- |
+| Sign-in cookie check | `accounts.google.com/ListAccounts` | enable `SkipListAccountsWithoutGaiaCookies` |
+| AI Mode eligibility | `www.google.com/async/folae` | disable `AimEnabled` |
+| Optimization Guide models | `optimizationguide-pa.googleapis.com/v1:GetModels` | disable `OptimizationHints` |
+| Network time | `clients2.google.com/time/1/current` | disable `NetworkTimeServiceQuerying` |
+| Preconnect to the default search engine | `https://www.google.com/` | disable `PreconnectToSearch` and `SearchEnginePreconnect2` |
+
+- The forwarder accepts only `CONNECT`. It resolves a name with `tokio::net::lookup_host` and keeps the
+  first IPv4 address. An IPv4 literal connects as given. A name with no IPv4 address gets reply 4, and an
+  IPv6 literal gets reply 8. The accept task owns the connection tasks in a `JoinSet`, so stopping the
+  session closes every relay. The forwarder listens on `127.0.0.1` only, on a temporary port.
+- A failed forwarder bind stops the start with `cannot start the IPv4 forwarder: {err}` and cleans the run
+  directory.
+- A browser page error gives one of these messages:
+  - `ERR_PROXY_CONNECTION_FAILED`: `cannot connect to the proxy`.
+  - A proxy that cannot reach the host: `the proxy cannot connect to {host}`.
+  - No proxy, and no IPv4 address or a failed IPv4 connection: `cannot connect to {host} over IPv4`.
+    Chrome gives `ERR_SOCKS_CONNECTION_FAILED` for every forwarder reply code.
+  - Other errors, such as a bad certificate: `cannot connect to {host}`.
 
 ## Data
 
@@ -190,12 +232,13 @@ flowchart LR
   `[testing.base_urls]` applies to both methods.
   The same exit code applies to an unknown key, an empty list, or a missing `--config` file. A TOML error shows a
   redacted parser message and the line number.
-  The optional `proxy` key applies to HTTP queries. It accepts an HTTP, SOCKS5, or SOCKS5H URL.
-  The URL has no path, query, or fragment, apart from a bare trailing `/`.
+  The optional `proxy` key applies to HTTP queries and, with `--browser`, to all Chrome traffic. It accepts
+  an HTTP, SOCKS5, or SOCKS5H URL. The URL has no path, query, or fragment, apart from a bare trailing `/`.
   An invalid proxy URL stops startup with exit code 1. The start line shows only the proxy scheme, host and port.
   An unencoded `#`, `?`, or `/` in the password stops startup with a message to percent-encode the password.
-  That message omits the URL.
-  Failed proxy connections return `error`. The engine client makes no direct fallback request.
+  That message omits the URL. With `--browser`, a user name or a password in the URL stops startup with
+  exit code 1 and a fixed message that has no part of the URL.
+  Failed proxy connections return `error`. The engine client and Chrome make no direct fallback request.
   The optional `[limits]` table applies to all enabled engines. Each omitted key keeps its default.
 
   ```toml
@@ -341,8 +384,10 @@ flowchart LR
   the socket does not remove a port. Its search results and memory were not measured. Chrome stays, and a person can
   connect another browser through a CDP URL when that feature is built.
 - **IPv4 for local DNS.** IPv6 breaks DDG, Brave, Mojeek, Startpage and Qwant (SearXNG #6833).
-  Direct engine connections and `socks5://` use the local IPv4-only resolver.
+  Direct HTTP engine connections and `socks5://` use the local IPv4-only resolver.
   With `http://` and `socks5h://`, the proxy resolves engine hostnames and chooses IPv4 or IPv6.
+  The browser tier keeps the same IPv4 rule. Without a proxy, Chrome reaches engines through the local
+  SOCKS5 forwarder, which keeps only IPv4 addresses.
 - **State in memory.** This is the smallest store that works for one daemon. We did not use SQLite or a file. Add
   one if restarts reset the daily limits too often.
 - **The CLI uses the JSON API, not an MCP client.** `curl` and SearXNG clients can use the same endpoint. The CLI

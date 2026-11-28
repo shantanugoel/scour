@@ -8,6 +8,7 @@ mod engines;
 mod limits;
 mod mcp;
 mod search;
+mod socks;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -116,7 +117,7 @@ async fn start_daemon(
         .await
         .map_err(|err| format!("cannot listen on {address}: {err}"))?;
     let browser = browser
-        .map(|settings| Browser::open(settings, config.browser_idle))
+        .map(|settings| Browser::open(settings, config.browser_idle, config.proxy.clone()))
         .transpose()?;
     let searcher = Arc::new(searcher.with_browser(browser));
     let bound_address = listener

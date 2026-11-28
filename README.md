@@ -227,7 +227,7 @@ Invalid TOML stops the daemon with exit code 1. The same exit code applies to an
 duplicate engine name, an unknown method, an empty list, or a missing `--config` file.
 A TOML error shows a redacted parser message and the line number.
 
-Set the optional `proxy` key to send HTTP engine requests through one proxy. Browser proxy support is planned.
+Set the optional `proxy` key to send engine requests through one proxy.
 
 ```toml
 proxy = "http://127.0.0.1:8080"
@@ -242,7 +242,13 @@ The daemon prints only the proxy scheme, host and port at startup.
 An invalid proxy URL stops startup with exit code 1.
 If the proxy fails, the engine reports `error` and the daemon makes no direct request.
 
-With `socks5://`, scour resolves engine hostnames locally and uses IPv4.
+With `--browser`, Chrome sends all its traffic through `proxy`, and never goes direct. The proxy resolves
+engine hostnames for all three schemes. A proxy with a user name or a password stops `--browser` with exit
+code 1. With no proxy, Chrome connects to engines over IPv4 only, through a local forwarder.
+Chrome rejects `socks5h`, so scour passes that scheme to Chrome as `socks5`. Chrome's `socks5` sends the
+engine hostname to the proxy.
+
+For HTTP queries with `socks5://`, scour resolves engine hostnames locally and uses IPv4.
 With `http://` and `socks5h://`, the proxy resolves engine hostnames and chooses IPv4 or IPv6.
 The CLI connects to the local daemon directly, regardless of the config or environment proxy settings.
 

@@ -114,7 +114,15 @@ fn parse(text: &str, browser: bool) -> Result<Config, String> {
         (config.engines, config.methods) = select_engines(names, browser)?;
     }
     if let Some(value) = file.proxy {
-        config.proxy = Some(parse_proxy(&value).map_err(str::to_string)?);
+        let proxy = parse_proxy(&value).map_err(str::to_string)?;
+        if browser && (!proxy.username().is_empty() || proxy.password().is_some()) {
+            return Err(
+                "the browser cannot use a proxy with a user name or a password; \
+                        remove them from proxy, or start without --browser"
+                    .to_string(),
+            );
+        }
+        config.proxy = Some(proxy);
     }
     if let Some(burst) = limit_value(
         file.limits.burst,
