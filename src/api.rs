@@ -163,6 +163,7 @@ async fn get_status(State(searcher): State<Arc<Searcher>>) -> Json<StatusRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -737,10 +738,20 @@ bing = "{engine_base}"
         let tools = listed["result"]["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "search");
-        assert_eq!(
-            tools[0]["inputSchema"]["properties"]["query"]["type"],
-            "string"
+        let schema = &tools[0]["inputSchema"];
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        // An optional list may also allow `null`.
+        let engines = &schema["properties"]["engines"];
+        let array = serde_json::json!("array");
+        assert!(
+            engines["type"] == array
+                || engines["type"]
+                    .as_array()
+                    .is_some_and(|types| types.contains(&array)),
+            "{engines}"
         );
+        assert_eq!(engines["items"]["type"], "string");
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
         let description = tools[0]["description"].as_str().expect("description");
         assert!(description.contains("untrusted"));
 
@@ -964,5 +975,216 @@ bing = "{engine_base}"
 
         let (status, _) = raw(address, &get("/mcp", &[&local], &[])).await;
         assert_eq!(status, 405);
+    }
+
+    /// A daemon with the named engines enabled, each sent to a local page.
+    /// The counters prove which engine requests went out.
+    async fn daemon_with_engines(
+        names: &[&str],
+    ) -> (&'static str, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let duckduckgo_requests = Arc::new(AtomicUsize::new(0));
+        let bing_requests = Arc::new(AtomicUsize::new(0));
+        let (duckduckgo, bing) = (duckduckgo_requests.clone(), bing_requests.clone());
+        let app = axum::Router::new()
+            .route(
+                "/html/",
+                axum::routing::get(move || {
+                    duckduckgo.fetch_add(1, Ordering::SeqCst);
+                    async { include_str!("../fixtures/duckduckgo/results.html") }
+                }),
+            )
+            .route(
+                "/search",
+                axum::routing::get(move || {
+                    bing.fetch_add(1, Ordering::SeqCst);
+                    async { include_str!("../fixtures/bing/results.html") }
+                }),
+            );
+        let (engine_base, engine_address) = serve(app).await;
+        let list = names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut text = format!("engines = [{list}]\n[testing.base_urls]\n");
+        for name in names {
+            text.push_str(&format!("{name} = \"{engine_base}\"\n"));
+        }
+        let path = std::env::temp_dir().join(format!(
+            "scour-engines-{}-{}.toml",
+            std::process::id(),
+            engine_address.port()
+        ));
+        std::fs::write(&path, text).unwrap();
+        let config = crate::config::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        let searcher = Arc::new(Searcher::new(&config.unwrap()).unwrap());
+        let (base, _) = serve(router(searcher)).await;
+        (base, duckduckgo_requests, bing_requests)
+    }
+
+    /// `GET /search` with `engines` as one comma-separated parameter.
+    async fn search_with_engines(
+        base: &str,
+        query: &str,
+        engines: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        let mut url = url::Url::parse(&format!("{base}/search")).unwrap();
+        url.query_pairs_mut().append_pair("q", query);
+        if let Some(engines) = engines {
+            url.query_pairs_mut().append_pair("engines", engines);
+        }
+        let response = client()
+            .get(url.as_str())
+            .send()
+            .await
+            .expect("search request");
+        let status = response.status().as_u16();
+        (status, response.json().await.expect("a JSON answer"))
+    }
+
+    async fn mcp_search_with_engines(
+        base: &str,
+        query: &str,
+        engines: &[&str],
+    ) -> serde_json::Value {
+        let (status, mut called) = rpc(
+            base,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": query, "engines": engines}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        called["result"].take()
+    }
+
+    /// The name and method of each engine in an answer, sorted by name.
+    fn names_and_methods(answer: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        let mut engines: Vec<_> = answer["engines"]
+            .as_array()
+            .expect("engines")
+            .iter()
+            .map(|engine| {
+                (
+                    engine["name"].as_str().unwrap().to_string(),
+                    engine["method"].clone(),
+                )
+            })
+            .collect();
+        engines.sort_by(|left, right| left.0.cmp(&right.0));
+        engines
+    }
+
+    fn http(names: &[&str]) -> Vec<(String, serde_json::Value)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), serde_json::json!("http")))
+            .collect()
+    }
+
+    fn result_engines(answer: &serde_json::Value) -> HashSet<String> {
+        answer["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["engine"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_engines_list_asks_only_the_named_engines_over_http() {
+        let (base, duckduckgo, bing) = daemon_with_engines(&["duckduckgo", "bing"]).await;
+        let counts = || {
+            (
+                duckduckgo.load(Ordering::SeqCst),
+                bing.load(Ordering::SeqCst),
+            )
+        };
+
+        let (status, answer) = search_with_engines(base, "rust", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(names_and_methods(&answer), http(&["bing", "duckduckgo"]));
+        assert_eq!(counts(), (1, 1));
+
+        let (status, answer) = search_with_engines(base, "rust", Some("duckduckgo")).await;
+        assert_eq!(status, 200);
+        assert_eq!(names_and_methods(&answer), http(&["duckduckgo"]));
+        assert_eq!(answer["engines"][0]["state"], "ok");
+        assert_eq!(
+            result_engines(&answer),
+            HashSet::from(["duckduckgo".into()])
+        );
+        assert_eq!(counts(), (2, 1));
+
+        let called = mcp_search_with_engines(base, "rust", &["duckduckgo"]).await;
+        assert_eq!(called["isError"], false);
+        let answer = &called["structuredContent"];
+        assert_eq!(names_and_methods(answer), http(&["duckduckgo"]));
+        assert_eq!(result_engines(answer), HashSet::from(["duckduckgo".into()]));
+        assert_eq!(counts(), (3, 1));
+
+        let (status, answer) = search_with_engines(base, "rust", Some("bing@http")).await;
+        assert_eq!(status, 200);
+        assert_eq!(names_and_methods(&answer), http(&["bing"]));
+        assert_eq!(counts(), (3, 2));
+
+        let (status, answer) = search_with_engines(base, "rust", Some("bing,duckduckgo")).await;
+        assert_eq!(status, 200);
+        assert_eq!(names_and_methods(&answer), http(&["bing", "duckduckgo"]));
+        assert_eq!(counts(), (4, 3));
+    }
+
+    #[tokio::test]
+    async fn a_bad_engines_list_names_the_item_and_sends_no_engine_request() {
+        let (base, duckduckgo, bing) = daemon_with_engines(&["duckduckgo"]).await;
+        for (list, item) in [
+            ("duckduckgo,yahoo", "yahoo"),
+            ("duckduckgo,bing", "bing"),
+            ("duckduckgo,duckduckgo", "duckduckgo"),
+            ("", ""),
+            ("duckduckgo@ftp", "duckduckgo@ftp"),
+        ] {
+            let (status, body) = search_with_engines(base, "rust", Some(list)).await;
+            assert_eq!(status, 400, "engines={list}");
+            let error = body["error"].as_str().expect("an error message");
+            assert!(
+                !error.is_empty() && error.contains(item),
+                "engines={list}: {error}"
+            );
+
+            let items: Vec<&str> = list.split(',').filter(|item| !item.is_empty()).collect();
+            let called = mcp_search_with_engines(base, "rust", &items).await;
+            assert_eq!(called["isError"], true, "{items:?}: {called}");
+            let text = called["content"][0]["text"].as_str().unwrap();
+            assert!(!text.is_empty() && text.contains(item), "{items:?}: {text}");
+        }
+        assert_eq!(duckduckgo.load(Ordering::SeqCst), 0);
+        assert_eq!(bing.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_browser_item_with_the_browser_off_names_the_item_and_the_browser_flag() {
+        let (base, duckduckgo, _) = daemon_with_engines(&["duckduckgo"]).await;
+
+        let (status, body) = search_with_engines(base, "rust", Some("duckduckgo@browser")).await;
+        assert_eq!(status, 400);
+        let error = body["error"].as_str().expect("an error message");
+        assert!(error.contains("duckduckgo@browser"), "{error}");
+        assert!(error.contains("--browser"), "{error}");
+
+        let called = mcp_search_with_engines(base, "rust", &["duckduckgo@browser"]).await;
+        assert_eq!(called["isError"], true, "{called}");
+        let text = called["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("duckduckgo@browser"), "{text}");
+        assert!(text.contains("--browser"), "{text}");
+
+        assert_eq!(duckduckgo.load(Ordering::SeqCst), 0);
     }
 }
