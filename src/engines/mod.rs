@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod bing;
 pub mod duckduckgo;
+pub mod google;
 
 /// How a query reaches an engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
