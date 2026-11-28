@@ -86,7 +86,7 @@ flowchart LR
   - A bad list stops the whole query with HTTP 400 (MCP `isError: true`), and no engine request goes out.
     The message names the item. Bad items are:
     1. An unknown name, an engine that is not enabled, a duplicate name, or an empty list.
-    2. An unknown method.
+    2. An unknown method, or a method that the engine does not support, for example `google@http`.
     3. An `@browser` item when the browser tier is off, for example
        `duckduckgo@browser needs the browser; start scour serve with --browser`.
 - **Engine state.** HTTP 403 and 429 give `blocked` for any engine. For other statuses, the page reader can
