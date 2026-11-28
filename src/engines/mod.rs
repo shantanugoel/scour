@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod bing;
 pub mod duckduckgo;
 
-/// How a query reaches an engine. The browser tier arrives in a later slice.
+/// How a query reaches an engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
@@ -27,9 +27,8 @@ impl Method {
         }
     }
 
-    /// The browser tier is not built, so every browser item is unavailable.
-    pub fn check_available(self, item: &str) -> Result<(), String> {
-        if self == Self::Browser {
+    pub fn check_available(self, item: &str, browser: bool) -> Result<(), String> {
+        if self == Self::Browser && !browser {
             return Err(format!(
                 "{item} needs the browser; start scour serve with --browser"
             ));
@@ -45,7 +44,7 @@ pub fn parse_item(item: &str) -> Result<(&str, Option<Method>), String> {
     };
     let Some(method) = Method::parse(method) else {
         return Err(format!(
-            "unknown method in engine item `{item}`; use `name` or `name@http`"
+            "unknown method in engine item `{item}`; use `name`, `name@http` or `name@browser`"
         ));
     };
     Ok((name, Some(method)))

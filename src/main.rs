@@ -1,4 +1,5 @@
 mod api;
+mod browser;
 mod cli;
 mod config;
 #[cfg(test)]
@@ -16,6 +17,9 @@ use std::sync::Arc;
 use axum::{Router, serve::Serve};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{Signal, SignalKind, signal};
+
+use browser::BrowserSettings;
 
 #[derive(Parser)]
 #[command(name = "scour")]
@@ -31,6 +35,9 @@ enum Command {
         /// Read this TOML file instead of the default config file.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Enable the browser method and start Chrome on its first query.
+        #[arg(long)]
+        browser: bool,
     },
     /// Ask the local daemon to search.
     Search {
@@ -47,7 +54,7 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Serve { config } => serve(config).await,
+        Command::Serve { config, browser } => serve(config, browser).await,
         Command::Search { query, engines } => {
             cli::search(api::ADDR, &query, engines.as_deref()).await
         }
@@ -55,28 +62,56 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn serve(config_path: Option<PathBuf>) -> ExitCode {
-    let server = match start_daemon(config_path.as_deref(), api::ADDR).await {
-        Ok(server) => server,
+async fn serve(config_path: Option<PathBuf>, browser: bool) -> ExitCode {
+    let browser = browser.then(BrowserSettings::fixed);
+    let daemon = match start_daemon(config_path.as_deref(), api::ADDR, browser).await {
+        Ok(daemon) => daemon,
         Err(message) => {
             eprintln!("scour: {message}");
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = server.await {
+    if let Err(err) = daemon.run().await {
         eprintln!("scour: the server stopped: {err}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 
-pub(crate) async fn start_daemon(
+struct Daemon {
+    server: Serve<TcpListener, Router, Router>,
+    searcher: Arc<search::Searcher>,
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Daemon {
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.server.local_addr()
+    }
+
+    async fn run(mut self) -> std::io::Result<()> {
+        let result = tokio::select! {
+            result = self.server.into_future() => result,
+            _ = self.interrupt.recv() => Ok(()),
+            _ = self.terminate.recv() => Ok(()),
+        };
+        self.searcher.stop_browser().await;
+        result
+    }
+}
+
+async fn start_daemon(
     config_path: Option<&Path>,
     address: SocketAddr,
-) -> Result<Serve<TcpListener, Router, Router>, String> {
-    let config = config::load(config_path)?;
-    let searcher =
-        search::Searcher::new(&config).map_err(|_| "cannot start the search client".to_string())?;
+    browser: Option<BrowserSettings>,
+) -> Result<Daemon, String> {
+    let config = config::load(config_path, browser.is_some())?;
+    let searcher = Arc::new(
+        search::Searcher::new(&config, browser)
+            .map_err(|_| "cannot start the search client".to_string())?,
+    );
     let listener = TcpListener::bind(address)
         .await
         .map_err(|err| format!("cannot listen on {address}: {err}"))?;
@@ -88,6 +123,16 @@ pub(crate) async fn start_daemon(
         .as_ref()
         .map(|url| format!(" (proxy {})", config::proxy_address(url)))
         .unwrap_or_default();
+    let interrupt =
+        signal(SignalKind::interrupt()).map_err(|err| format!("cannot handle SIGINT: {err}"))?;
+    let terminate =
+        signal(SignalKind::terminate()).map_err(|err| format!("cannot handle SIGTERM: {err}"))?;
     println!("scour: listening on http://{bound_address}{proxy}");
-    Ok(axum::serve(listener, api::router(Arc::new(searcher))))
+    let server = axum::serve(listener, api::router(searcher.clone()));
+    Ok(Daemon {
+        server,
+        searcher,
+        interrupt,
+        terminate,
+    })
 }

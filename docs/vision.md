@@ -30,8 +30,9 @@ A scenario:
    uses it.
 5. The agent gets the results, and the state of each engine. If each engine rests, the agent gets no results, the
    state `blocked`, and the time when the engine is ready again.
-6. The owner starts the daemon with the planned `--browser` flag. The daemon can then ask Google through Chrome
-   on a virtual display. The owner or the agent can also send another engine, such as DuckDuckGo, through Chrome.
+6. The owner starts the daemon with `--browser`. The daemon can then send an engine, such as DuckDuckGo, through
+   headful Chrome on a virtual display. Google through the browser is planned. The owner or the agent can also
+   send any enabled engine through Chrome.
 7. Google shows a CAPTCHA. The daemon gives the calling agent a live link to that browser on `127.0.0.1`, and the
    agent passes it to a person.
 8. The person opens the link, through an SSH tunnel from another computer, and solves the CAPTCHA. The agent
@@ -50,16 +51,16 @@ The first useful version lets a person or an agent do these things:
 - An agent can search the web through MCP over HTTP, and get results from DuckDuckGo, the default cheap HTTP
   engine. A person can turn on Bing. Brave and Mojeek are planned as opt-in engines.
   scour merges the results when two or more engines answer.
-- A planned `engines` argument will let an agent select the engines for one query, and the method of each
-  engine: HTTP or the browser (for example, `duckduckgo@browser`). The config sets the default method.
+- An `engines` argument lets an agent select the engines for one query, and the method of each engine:
+  HTTP or the browser (for example, `duckduckgo@browser`). The config sets the default method.
 - A person can start one daemon (`scour serve`) that all agents on the machine share, and can search from the CLI.
   A person who runs scour on a server can send the engine requests through one proxy.
 - An agent can see the state of each engine (`ok`, `empty`, `blocked`, `limited`, `parse_failed`, `error`).
   When an engine rests, the agent gets `blocked` and the time when the engine is ready again.
-- The planned `--browser` flag will start the browser tier. A person can then turn on Google, and send any other
-  engine through the browser. The tier will use headful Chrome on a virtual display (Xvfb).
-  Chrome will run in a separate process. A person will be able to connect to another Chrome instance through a CDP URL.
-- The planned browser tier will let a person solve a CAPTCHA through a live link that the agent passes on.
+- The `--browser` flag starts the browser tier. A person can send any enabled engine through the browser.
+  The tier uses headful Chrome on a virtual display (Xvfb). Chrome runs in a separate process.
+  Google through the browser is planned. A CDP URL from a person is planned.
+- The planned CAPTCHA handoff will let a person solve a CAPTCHA through a live link that the agent passes on.
   A person can open the link on the machine that runs scour, or from another computer through an SSH tunnel.
 
 Planned for a later milestone: an agent can fetch one page as Markdown. A person can connect an external CAPTCHA
@@ -85,7 +86,7 @@ solver plugin.
 - We do not make Bing, Brave or Mojeek a default engine. In the cheap-engine spike, 0 of 238 plain HTTP Bing
   results matched the query. Brave gave HTTP 429 and Mojeek gave HTTP 403. A person can turn on Bing. Brave and
   Mojeek are planned.
-- We do not promise that Bing works through the browser. A person can send Bing through the planned browser tier,
+- We do not promise that Bing works through the browser. A person can send Bing through the browser tier,
   but the results in headful Chrome were not stable. In the Bing-in-Chrome spike (#31), direct loads got Turnstile on
   3 of 4 tries. After a person solved it, 0 of 30 results matched the query. In the Ardia spike (#32), the same
   Chrome setup got Bing results on 6 of 6 queries, and 24 of 57 results matched all query words.
@@ -107,7 +108,9 @@ solver plugin.
 - **Platform and language:** Rust, because the owner selected it and a static binary is small. The spike program
   with `wreq` is a static musl binary of 8.2 MB, with a peak of 28.8 MiB of memory. Linux only for the first
   release. There are two Docker images: `scour` (the binary and the cheap engines) and `scour:browser` (the
-  binary, Chrome and Xvfb). On bare Linux, the user installs Chrome and Xvfb, and sets the path of Chrome.
+  binary, Chrome and Xvfb). On bare Linux, the user installs Chrome or Chromium and Xvfb.
+  scour runs `Xvfb` from `PATH`. For Chrome, it checks `CHROME`, then `chrome`, `chrome-browser`,
+  `google-chrome-stable`, `chromium` and `chromium-browser` on `PATH`, in that order.
 - **Cost:** The core uses no paid service. A CAPTCHA solver service is an external plugin that the user pays for.
   Tests make no paid model call.
 - **Privacy and data:** scour runs on the machine of the user. It keeps no queries and no results on disk. It keeps

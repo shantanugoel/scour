@@ -11,14 +11,16 @@ use url::Url;
 use crate::api::{
     EngineHealth, EngineState, EngineStatus, ResultItem, SearchResponse, StatusResponse,
 };
+use crate::browser::{Browser, BrowserSettings};
 use crate::config::Config;
 use crate::engines::{self, Engine, Hit, Method, Page};
 use crate::limits::{Admit, Limits};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Searcher {
     client: wreq::Client,
+    browser: Option<Browser>,
     engines: Vec<EngineSlot>,
     daily_limit: u32,
 }
@@ -55,7 +57,7 @@ impl Answer {
 }
 
 impl Searcher {
-    pub fn new(config: &Config) -> wreq::Result<Self> {
+    pub fn new(config: &Config, browser: Option<BrowserSettings>) -> wreq::Result<Self> {
         let builder = http_client_builder();
         let builder = match &config.proxy {
             Some(url) => {
@@ -65,10 +67,14 @@ impl Searcher {
             None => builder.no_proxy(),
         };
         let client = builder.build().map_err(wreq::Error::without_uri)?;
-        Ok(Self::with_client(config, client))
+        Ok(Self::with_client(config, client, browser))
     }
 
-    fn with_client(config: &Config, client: wreq::Client) -> Self {
+    fn with_client(
+        config: &Config,
+        client: wreq::Client,
+        browser: Option<BrowserSettings>,
+    ) -> Self {
         let engines = config
             .engines
             .iter()
@@ -89,8 +95,15 @@ impl Searcher {
             .collect();
         Self {
             client,
+            browser: browser.map(Browser::new),
             engines,
             daily_limit: config.limits.daily,
+        }
+    }
+
+    pub async fn stop_browser(&self) {
+        if let Some(browser) = &self.browser {
+            browser.stop().await;
         }
     }
 
@@ -139,7 +152,7 @@ impl Searcher {
                 return Err(format!("engine `{item}` is listed more than once"));
             }
             let method = method.unwrap_or(self.engines[index].method);
-            method.check_available(item)?;
+            method.check_available(item, self.browser.is_some())?;
             selected.push((index, method));
         }
         Ok(selected)
@@ -153,7 +166,7 @@ impl Searcher {
             let query = query.clone();
             tasks.spawn(async move {
                 let slot = &searcher.engines[index];
-                let (answer, ready_at) = searcher.search_engine(slot, &query).await;
+                let (answer, ready_at) = searcher.search_engine(slot, &query, method).await;
                 let status = EngineStatus {
                     name: slot.engine.name.to_string(),
                     method,
@@ -224,6 +237,7 @@ impl Searcher {
         &self,
         slot: &EngineSlot,
         query: &str,
+        method: Method,
     ) -> (Answer, Option<DateTime<Utc>>) {
         let (now, wall, admit) = {
             let mut limits = slot.limits.lock().expect("engine limits");
@@ -251,7 +265,11 @@ impl Searcher {
                 return (Answer::without_hits(EngineState::Blocked), ready_at);
             }
         }
-        let answer = self.fetch(slot, query).await;
+        let url = (slot.engine.request_url)(&slot.base_url, query);
+        let answer = match method {
+            Method::Http => self.fetch_http(slot.engine, &url).await,
+            Method::Browser => self.fetch_browser(slot.engine, &url).await,
+        };
         let ready_at = slot.limits.lock().expect("engine limits").record(
             answer.state,
             Instant::now(),
@@ -260,10 +278,8 @@ impl Searcher {
         (answer, ready_at)
     }
 
-    async fn fetch(&self, slot: &EngineSlot, query: &str) -> Answer {
-        let engine = slot.engine;
-        let host = slot.base_url.host_str().unwrap_or(engine.base_url);
-        let url = (engine.request_url)(&slot.base_url, query);
+    async fn fetch_http(&self, engine: &Engine, url: &Url) -> Answer {
+        let host = url.host_str().unwrap_or(engine.base_url);
         match self
             .client
             .get(url.as_str())
@@ -274,15 +290,23 @@ impl Searcher {
             Ok(response) => {
                 let status = response.status().as_u16();
                 if matches!(status, 403 | 429) {
-                    return Answer::without_hits(EngineState::Blocked);
+                    return answer_for(engine, status, "");
                 }
                 match response.text().await {
-                    Ok(body) => answer_for_page(engine, status, &body),
+                    Ok(body) => answer_for(engine, status, &body),
                     Err(_) if status != 200 => Answer::error(format!("HTTP {status}")),
                     Err(err) => Answer::error(fetch_error(&err, host)),
                 }
             }
             Err(err) => Answer::error(fetch_error(&err, host)),
+        }
+    }
+
+    async fn fetch_browser(&self, engine: &Engine, url: &Url) -> Answer {
+        let browser = self.browser.as_ref().expect("validated browser method");
+        match browser.fetch(url).await {
+            Ok(page) => answer_for(engine, page.status, &page.html),
+            Err(message) => Answer::error(message),
         }
     }
 }
@@ -291,7 +315,10 @@ fn format_deadline(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn answer_for_page(engine: &Engine, status: u16, body: &str) -> Answer {
+fn answer_for(engine: &Engine, status: u16, body: &str) -> Answer {
+    if matches!(status, 403 | 429) {
+        return Answer::without_hits(EngineState::Blocked);
+    }
     match (engine.read)(status, body) {
         Page::Blocked => Answer::without_hits(EngineState::Blocked),
         _ if status != 200 => Answer::error(format!("HTTP {status}")),
@@ -370,7 +397,7 @@ mod tests {
             format!("proxy = \"{scheme}://{userinfo}{address}\"\n"),
         )
         .unwrap();
-        let config = crate::config::load(Some(&path));
+        let config = crate::config::load(Some(&path), false);
         std::fs::remove_file(path).unwrap();
         config.unwrap()
     }
@@ -381,7 +408,7 @@ mod tests {
         let address = proxy.local_addr().unwrap();
         // A `#` in the password must be percent-encoded, and the proxy gets it decoded.
         let config = proxy_config("http", address, "fixture-user:fixture%23password@");
-        let searcher = Arc::new(Searcher::new(&config).unwrap());
+        let searcher = Arc::new(Searcher::new(&config, None).unwrap());
 
         timeout(Duration::from_secs(3), async {
             tokio::join!(searcher.search("offline"), async {
@@ -434,7 +461,7 @@ mod tests {
             "duckduckgo",
             Url::parse(&format!("http://localhost:{port}")).unwrap(),
         );
-        let searcher = Arc::new(Searcher::new(&config).unwrap());
+        let searcher = Arc::new(Searcher::new(&config, None).unwrap());
         timeout(Duration::from_secs(3), async {
             tokio::join!(searcher.search("offline"), async {
                 let (mut stream, _) = proxy.accept().await.unwrap();
@@ -471,7 +498,7 @@ mod tests {
             "duckduckgo",
             Url::parse(&format!("http://{target_addr}")).unwrap(),
         );
-        let searcher = Arc::new(Searcher::new(&config).unwrap());
+        let searcher = Arc::new(Searcher::new(&config, None).unwrap());
 
         let response = tokio::select! {
             biased;
@@ -515,6 +542,7 @@ mod tests {
                 ..Config::default()
             },
             client,
+            None,
         ))
     }
 
@@ -658,11 +686,14 @@ mod tests {
             );
         let base = Url::parse(serve(app).await).unwrap();
         let searcher = Arc::new(
-            Searcher::new(&Config {
-                engines: vec![&bing::ENGINE, &duckduckgo::ENGINE],
-                base_urls: [("bing", base.clone()), ("duckduckgo", base)].into(),
-                ..Config::default()
-            })
+            Searcher::new(
+                &Config {
+                    engines: vec![&bing::ENGINE, &duckduckgo::ENGINE],
+                    base_urls: [("bing", base.clone()), ("duckduckgo", base)].into(),
+                    ..Config::default()
+                },
+                None,
+            )
             .unwrap(),
         );
         let response = searcher.search("x").await;

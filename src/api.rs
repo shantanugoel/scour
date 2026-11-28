@@ -258,11 +258,14 @@ mod tests {
             read: read_page,
         }));
         Arc::new(
-            Searcher::new(&Config {
-                engines: vec![engine],
-                limits,
-                ..Config::default()
-            })
+            Searcher::new(
+                &Config {
+                    engines: vec![engine],
+                    limits,
+                    ..Config::default()
+                },
+                None,
+            )
             .expect("client"),
         )
     }
@@ -295,7 +298,7 @@ mod tests {
             limits,
             ..Config::default()
         };
-        (Arc::new(Searcher::new(&config).unwrap()), requests)
+        (Arc::new(Searcher::new(&config, None).unwrap()), requests)
     }
 
     fn client() -> wreq::Client {
@@ -430,9 +433,9 @@ bing = "{engine_base}"
             ),
         )
         .unwrap();
-        let config = crate::config::load(Some(&path));
+        let config = crate::config::load(Some(&path), false);
         std::fs::remove_file(path).unwrap();
-        let searcher = Arc::new(Searcher::new(&config.unwrap()).unwrap());
+        let searcher = Arc::new(Searcher::new(&config.unwrap(), None).unwrap());
         let (base, address) = serve(router(searcher)).await;
 
         assert_eq!(
@@ -493,9 +496,9 @@ bing = "{engine_base}"
             format!("[testing]\nrest_seconds = 20\nbase_urls.duckduckgo = \"{engine_base}\"\n"),
         )
         .unwrap();
-        let config = crate::config::load(Some(&path));
+        let config = crate::config::load(Some(&path), false);
         std::fs::remove_file(path).unwrap();
-        let searcher = Searcher::new(&config.unwrap()).unwrap();
+        let searcher = Searcher::new(&config.unwrap(), None).unwrap();
         let (base, address) = serve(router(Arc::new(searcher))).await;
 
         assert_eq!(
@@ -1029,9 +1032,9 @@ bing = "{engine_base}"
             engine_address.port()
         ));
         std::fs::write(&path, text).unwrap();
-        let config = crate::config::load(Some(&path));
+        let config = crate::config::load(Some(&path), false);
         std::fs::remove_file(path).unwrap();
-        let searcher = Arc::new(Searcher::new(&config.unwrap()).unwrap());
+        let searcher = Arc::new(Searcher::new(&config.unwrap(), None).unwrap());
         let (base, _) = serve(router(searcher)).await;
         (base, duckduckgo_requests, bing_requests)
     }

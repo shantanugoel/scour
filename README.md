@@ -40,7 +40,6 @@ The daemon listens on `http://127.0.0.1:7268`. No flag changes this address.
    ./target/release/scour search --engines duckduckgo "rust async runtime"
    ```
 
-   Only the `http` method exists today. An item with `@browser` fails, because the browser tier is not built.
    An item can name only an engine that the config enables. The same list works in
    `GET /search?q=<text>&engines=duckduckgo` and in the MCP `engines` argument, which is a JSON array, as in
    `"engines": ["duckduckgo@http"]`.
@@ -56,7 +55,7 @@ Each result has a title, a URL and a snippet. The URL is the address of the resu
 
 When several engines are enabled, the daemon queries them in parallel. A query with `--engines` asks only the
 named engines. The daemon reports their states in config order. Each answer has `engines[]`, and each entry has
-`name`, `method`, `state`, `daily_count` and `daily_limit`. `method` is `http` today.
+`name`, `method`, `state`, `daily_count` and `daily_limit`. `method` is `http` or `browser`.
 The daemon takes one result from each engine in config order, then repeats for each rank.
 It keeps the first occurrence of each exact URL and numbers the merged results from 1.
 
@@ -75,7 +74,7 @@ Each summary line starts with `name@method`, for example `duckduckgo@http: ok (8
 
 A bad `engines` list stops the query with HTTP 400 (MCP `isError: true`), and no engine request goes out.
 The message names the item. A bad list has an unknown name, an engine that is not enabled, a duplicate name,
-an empty list, or an unknown method. An `@browser` item fails with a message that names `--browser`.
+an empty list, or an unknown method. An `@browser` item requires `scour serve --browser`.
 
 After a block, the daemon skips requests to that engine for 10 minutes by default. Each consecutive block doubles the rest, up to 4 hours.
 An `ok` response resets the backoff. An `empty`, `parse_failed` or `error` response leaves it unchanged.
@@ -98,6 +97,21 @@ If the rounded time is 60 seconds or more, they show it in minutes rounded up.
 Before the first search, the CLI shows `idle` and the JSON field `last_state` is `null`.
 Status shows `ready_at` for active rest, a full daily window, or a pace wait longer than 30 seconds or one refill interval.
 When a deadline appears, `scour status` also prints the remaining time.
+
+### Run with Chrome
+
+Install Chrome or Chromium and put `Xvfb` on `PATH`. Set `CHROME` to the executable path to choose a specific Chrome.
+
+```sh
+./target/release/scour serve --browser
+# In a second terminal:
+./target/release/scour search --engines duckduckgo@browser "rust async runtime"
+```
+
+Chrome starts on the first browser query. Its DevTools port is fixed at `127.0.0.1:7269`.
+A user-supplied Chrome DevTools URL is planned. HTTP and browser queries share the engine's limits and rest.
+The daemon keeps the temporary profile under `/tmp`, because Chrome's Unix socket path has a length limit.
+Stop the daemon with Ctrl-C or SIGTERM to close Chrome and Xvfb and delete the temporary profile.
 
 ## Docker
 
@@ -180,15 +194,14 @@ Or start the daemon with a file:
 ./target/release/scour serve --config /path/to/config.toml
 ```
 
-The `engines` list accepts `duckduckgo` and `bing`. Each item can end with `@http`, for example
-`["duckduckgo@http", "bing"]`. A bare name means `http`.
-Only the `http` method exists. An item with `@browser` stops startup with exit code 1 and a message that
-names `--browser`, because the browser tier is planned.
+The `engines` list accepts `duckduckgo` and `bing`. A bare name means `http`.
+With `scour serve --browser`, use `engines = ["duckduckgo@browser"]` to make Chrome the default for DuckDuckGo.
+An `@browser` item stops startup with exit code 1 if the browser tier is off.
 Invalid TOML stops the daemon with exit code 1. The same exit code applies to an unknown key, an unknown or
 duplicate engine name, an unknown method, an empty list, or a missing `--config` file.
 A TOML error shows a redacted parser message and the line number.
 
-Set the optional `proxy` key to send all engine requests through one proxy.
+Set the optional `proxy` key to send HTTP engine requests through one proxy. Browser proxy support is planned.
 
 ```toml
 proxy = "http://127.0.0.1:8080"
@@ -236,14 +249,16 @@ Each engine still uses its normal search path and query parameters.
 
 ## Check
 
-You can run the check while `scour serve` is running.
+Install Chrome or Chromium, `openssl`, and either Xvfb or Docker. If `Xvfb` is absent from `PATH`, the first run
+builds the `scour-check-xvfb` Docker image. If Docker is available, the check also tests that shim.
+You can run the check while `scour serve --browser` has Chrome open.
 
 ```sh
 scripts/check
 ```
 
 The command checks the format and runs Clippy with warnings as errors.
-It also runs the tests, which use saved pages and loopback servers.
+It also runs the tests, which use saved pages, loopback servers, and headful Chrome.
 
 ## Size and memory
 

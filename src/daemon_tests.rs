@@ -7,6 +7,8 @@ use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{cli, start_daemon};
 
+mod browser;
+
 #[tokio::test]
 async fn daemon_redacts_proxy_start_line_and_cli_connects_directly() {
     const CHILD: &str = "SCOUR_PROXY_TEST_CHILD";
@@ -14,12 +16,12 @@ async fn daemon_redacts_proxy_start_line_and_cli_connects_directly() {
     const PASSWORD: &str = "fixture-password";
 
     if std::env::var_os(CHILD).is_some() {
-        let server = start_daemon(None, (Ipv4Addr::LOCALHOST, 0).into())
+        let server = start_daemon(None, (Ipv4Addr::LOCALHOST, 0).into(), None)
             .await
             .expect("start daemon");
         let address = server.local_addr().unwrap();
         tokio::select! {
-            result = server.into_future() => panic!("daemon stopped: {result:?}"),
+            result = server.run() => panic!("daemon stopped: {result:?}"),
             result = cli::status(address) => assert_eq!(result, ExitCode::SUCCESS),
         }
         return;
@@ -117,7 +119,7 @@ async fn cli_engines_option_asks_only_the_named_engine_and_prints_a_bad_item() {
         )
         .unwrap();
 
-        let server = start_daemon(None, (Ipv4Addr::LOCALHOST, 0).into())
+        let server = start_daemon(None, (Ipv4Addr::LOCALHOST, 0).into(), None)
             .await
             .expect("start daemon");
         let address = server.local_addr().unwrap();
@@ -128,7 +130,7 @@ async fn cli_engines_option_asks_only_the_named_engine_and_prints_a_bad_item() {
             )
         };
         tokio::select! {
-            result = server.into_future() => panic!("daemon stopped: {result:?}"),
+            result = server.run() => panic!("daemon stopped: {result:?}"),
             () = async {
                 let code = cli::search(address, "rust", Some("duckduckgo")).await;
                 assert_eq!(code, ExitCode::SUCCESS);

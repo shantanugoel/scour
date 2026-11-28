@@ -59,7 +59,7 @@ struct Testing {
     base_urls: HashMap<String, String>,
 }
 
-pub fn load(path: Option<&Path>) -> Result<Config, String> {
+pub fn load(path: Option<&Path>, browser: bool) -> Result<Config, String> {
     let explicit = path.is_some();
     let path = match path {
         Some(path) => path.to_path_buf(),
@@ -75,7 +75,7 @@ pub fn load(path: Option<&Path>) -> Result<Config, String> {
         }
         Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
     };
-    parse(&text)
+    parse(&text, browser)
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -97,11 +97,11 @@ fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<
     Some(base.join("scour").join("config.toml"))
 }
 
-fn parse(text: &str) -> Result<Config, String> {
+fn parse(text: &str, browser: bool) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|err| toml_error(&err, text))?;
     let mut config = Config::default();
     if let Some(names) = file.engines {
-        (config.engines, config.methods) = select_engines(names)?;
+        (config.engines, config.methods) = select_engines(names, browser)?;
     }
     if let Some(value) = file.proxy {
         config.proxy = Some(parse_proxy(&value).map_err(str::to_string)?);
@@ -189,6 +189,7 @@ pub fn proxy_address(url: &Url) -> String {
 
 fn select_engines(
     names: Vec<String>,
+    browser: bool,
 ) -> Result<(Vec<&'static Engine>, HashMap<&'static str, Method>), String> {
     if names.is_empty() {
         return Err("the engines list is empty".to_string());
@@ -204,7 +205,7 @@ fn select_engines(
             return Err(format!("engine `{item}` is listed more than once"));
         }
         if let Some(method) = method {
-            method.check_available(&item)?;
+            method.check_available(&item, browser)?;
             methods.insert(engine.name, method);
         }
         selected.push(engine);
@@ -239,7 +240,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("scour-config-{name}-{}.toml", std::process::id()));
         std::fs::write(&path, text).unwrap();
-        let loaded = load(Some(&path));
+        let loaded = load(Some(&path), false);
         let _ = std::fs::remove_file(&path);
         loaded
     }
